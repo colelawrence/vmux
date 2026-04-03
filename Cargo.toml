@@ -26,3 +26,29 @@ path = "src/lib.rs"
 [[bin]]
 name = "vmux"
 path = "src/main.rs"
+
+# Keep debug builds usable while optimizing the hot path enough for a smooth
+# interactive TUI experience.
+[profile.dev]
+opt-level = 1
+debug = 1
+incremental = true
+codegen-units = 16
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.vmux]
+opt-level = 2
+
+[profile.dev.package.ratatui]
+opt-level = 3
+
+[profile.dev.package.crossterm]
+opt-level = 3
+
+[profile.dev.package.portable-pty]
+opt-level = 3
+
+[profile.dev.package.vt100]
+opt-level = 3
