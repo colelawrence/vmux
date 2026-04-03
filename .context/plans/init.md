@@ -7,9 +7,9 @@ goal: vmux-vertical-tabs
 ## Goal
 **Goal document:** [vmux-vertical-tabs](../goals/vmux-vertical-tabs.md)
 
-Create a small wrapper experience around tmux whose primary job is to make tmux sessions feel like a **vertical tab sidebar**, with the main entry point being a single `vmux` command with no subcommands.
+Create a small wrapper experience around tmux whose primary job is to make tmux sessions feel like a **persistent vertical sidebar**, with the main entry point being a single `vmux` command with no subcommands.
 
-The product should focus on one thing only: **showing tmux sessions vertically** while tmux continues to own the real session and window state.
+The product should focus on one thing only: **showing tmux sessions vertically while keeping the sidebar visible alongside the chosen session** while tmux continues to own the real session and window state.
 
 ## Motivation
 The built-in tmux status bar is horizontal, and that shape does not match the workflow the user wants. The current tmux setup already has custom color behavior, bell highlighting, cwd-aware splits, and window management conventions, which suggests the UI problem is not lack of state — it is presentation.
@@ -17,16 +17,16 @@ The built-in tmux status bar is horizontal, and that shape does not match the wo
 A vertical sidebar-style view would make the active session list easier to scan, preserve the sense of a persistent workspace rail, and better match the user's mental model of “tabs” than tmux's default bottom bar.
 
 ## Ideal End State
-A user can run `vmux` and immediately get a terminal experience where tmux sessions are represented vertically instead of horizontally.
+A user can run `vmux` and immediately get a terminal experience where tmux sessions are represented vertically instead of horizontally, and the chosen session remains visible in the same screen.
 
 In the ideal end state:
 
 - tmux remains the source of truth for sessions, windows, panes, bell state, and titles
-- the native tmux status bar is hidden
 - the vertical sidebar stays synchronized with the live tmux state
 - active, inactive, and alerting sessions are visually distinct
 - the experience feels like a purpose-built vertical session UI rather than a hacked-around status line
 - the project stays narrowly scoped and does not expand into a general tmux replacement
+- the left sidebar stays up while the selected session is displayed on the right
 
 ## Table of Contents
 1. Scope and non-goals
@@ -45,6 +45,7 @@ In the ideal end state:
 - Sessions as the primary visible and testable unit; windows and panes may appear only as subordinate details
 - Sync with tmux state that the user already cares about, including active session and bell-driven attention cues
 - Respect for the existing tmux workflow, including cwd-aware pane/window behavior inside each session
+- A split-view host where the sidebar remains visible while the selected session is shown alongside it
 
 ### Out of scope
 - Replacing tmux as a terminal multiplexer
@@ -69,9 +70,9 @@ At a high level, the command should:
 
 The interaction should be interactive-first: the user should not need subcommands to reach the intended flow, and the plan does not assume a broad flag surface for v1. If flags are ever added, they should remain secondary and not turn into a separate mode system.
 
-Preferred v1 hosting model: a standalone companion process that owns the terminal while the session chooser is active and talks to tmux as a client, rather than living inside a tmux pane. That keeps the UI focused on the session rail and avoids making tmux’s layout the host layout.
+Preferred v1 hosting model: a standalone split-view host that owns the terminal, renders the vertical sidebar on the left, and runs the selected tmux session in the right pane via a child PTY. That keeps the sidebar visible while tmux still owns the session content.
 
-By default, `vmux` opens a session chooser. The chooser lets the user pick an existing tmux session or create a new real tmux session through tmux itself. If tmux is unavailable, vmux should fail clearly instead of inventing a fallback mode.
+By default, `vmux` opens with the sidebar visible and a selected session shown on the right. The user can move between existing tmux sessions and see the chosen session stay in place while the sidebar remains available. If tmux is unavailable, vmux should fail clearly instead of inventing a fallback mode.
 
 ## Experience target
 The UI should make the session list feel like a sidebar, not like a secondary dashboard.
@@ -91,6 +92,8 @@ The main architectural principle is simple: **tmux owns truth; vmux renders it**
 That means vmux may derive transient UI-only state, like attention fade timing, but it should not invent parallel durable session state.
 
 Vmux must tolerate external tmux changes made outside vmux and reconcile against live tmux state on every run.
+
+The selected session on the right should be a real tmux client in a child PTY, not a fake snapshot of terminal output.
 
 The UI layer must stay aligned with tmux changes such as:
 
@@ -121,7 +124,7 @@ The default test strategy should be system tests that prove real user-visible be
 The preferred seam is a `vmux` process running against an isolated tmux server and a temporary terminal environment. That lets tests verify outcomes such as:
 
 - the sidebar reflects the real tmux session list
-- selecting a session attaches to that session
+- selecting a session updates the right-hand tmux client
 - creating a session through `vmux` creates a real tmux session
 - bell or attention cues appear when tmux emits them
 - refreshes and resizes keep the sidebar readable and aligned
@@ -129,16 +132,16 @@ The preferred seam is a `vmux` process running against an isolated tmux server a
 
 Minimal v1 system-test battery:
 
-1. list and select an existing session
+1. list and select an existing session while the sidebar remains visible
 2. create a session via `vmux` and prove it exists in tmux
 3. emit a bell in a non-active session and observe a visible attention cue
-4. resize the terminal and confirm the sidebar remains readable
+4. resize the terminal and confirm both sidebar and right pane remain usable
 5. run without tmux available and confirm a clear non-destructive failure
 
-These tests should use a temporary tmux socket, temp home/config, and a pty or terminal harness. They should assert durable or visible outcomes: tmux session state, chosen session, rendered text or layout, and exit behavior. Wherever session existence or selection matters, the test should also verify the tmux oracle directly (for example via `tmux list-sessions` / `tmux list-windows`) rather than trusting only vmux-rendered text. They should not mock tmux, replace persistence with fakes, or prove only that helper methods were called.
+These tests should use a temporary tmux socket, temp home/config, and a pty or terminal harness. They should assert durable or visible outcomes: tmux session state, selected session, rendered text or layout, and exit behavior. Wherever session existence or selection matters, the test should also verify the tmux oracle directly (for example via `tmux list-sessions` / `tmux list-windows`) rather than trusting only vmux-rendered text. They should not mock tmux, replace persistence with fakes, or prove only that helper methods were called.
 
 ## Open questions
-The host model and chooser-first default are fixed decisions in this plan. The remaining questions below are only about presentation tuning within that choice.
+The host model is now fixed to a split-view layout. The remaining questions below are only about presentation tuning within that choice.
 
 A few things still need to be settled before the plan becomes concrete:
 
@@ -147,11 +150,11 @@ A few things still need to be settled before the plan becomes concrete:
 - How faithfully should attention coloring match the current tmux status behavior?
 
 ## Rough phases
-1. **Experience framing** — document the chosen hosting model, the chooser-first `vmux` behavior, and the minimum session data the vertical view must show. Phase 1 should end with those choices stated plainly so technical locking can proceed without reinterpreting the plan.
+1. **Experience framing** — document the chosen split-view host, the default session-selection behavior, and the minimum session data the vertical view must show. Phase 1 should end with those choices stated plainly so technical locking can proceed without reinterpreting the plan.
 2. **State mapping** — lock how tmux data is projected into the vertical UI and choose the initial sync strategy, using the Phase 1 decisions as fixed inputs.
-3. **Prototype** — build the simplest version that proves the sidebar feels right, starting with the smallest useful session/attention model, and add the first real system tests alongside it.
+3. **Prototype** — build the simplest version that proves the sidebar stays visible while the selected session is shown on the right, starting with the smallest useful session/attention model, and add the first real system tests alongside it.
 4. **Refinement** — tighten the color behavior, live updates, command flow, and system-test coverage without expanding the scope beyond vertical session navigation.
 
-Each phase should end with a short decision or proof artifact before the next phase starts: Phase 1 writes the chosen host/default/visible-field decisions, Phase 2 writes the tmux→vmux state projection and sync choice, Phase 3 demonstrates the vertical UI with the minimal system-test battery, and Phase 4 only adjusts polish and extends coverage. Phase 2 is not done until the sync strategy is explicit enough for the prototype and the system tests to use the same seam.
+Each phase should end with a short decision or proof artifact before the next phase starts: Phase 1 writes the chosen host/default/visible-field decisions, Phase 2 writes the tmux→vmux state projection and sync choice, Phase 3 demonstrates the split view with the minimal system-test battery, and Phase 4 only adjusts polish and extends coverage. Phase 2 is not done until the sync strategy is explicit enough for the prototype and the system tests to use the same seam.
 
 The project is successful when the user can stop thinking about the horizontal status bar entirely and just use tmux through a vertical session experience.

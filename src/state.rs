@@ -1,13 +1,5 @@
 use crate::tmux::TmuxSession;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppAction {
-    /// User chose to quit without attaching.
-    Quit,
-    /// User confirmed attaching to the given session index.
-    Attach(usize),
-}
-
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub sessions: Vec<TmuxSession>,
@@ -50,11 +42,4 @@ impl AppState {
         self.selected = (self.selected + 1) % self.sessions.len();
     }
 
-    pub fn confirm(&self) -> Option<AppAction> {
-        if self.sessions.is_empty() {
-            None
-        } else {
-            Some(AppAction::Attach(self.selected))
-        }
-    }
 }

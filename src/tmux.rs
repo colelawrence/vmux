@@ -42,9 +42,16 @@ impl From<std::string::FromUtf8Error> for TmuxError {
     }
 }
 
+/// Abstraction over tmux so the UI can be tested in isolation.
 pub trait TmuxAdapter {
+    /// List all tmux sessions.
     fn list_sessions(&mut self) -> Result<Vec<TmuxSession>, TmuxError>;
-    fn attach_or_switch(&mut self, session_name: &str) -> Result<(), TmuxError>;
+
+    /// Build a tmux client command that attaches to the given session.
+    ///
+    /// The caller is responsible for running this command in a PTY so that
+    /// tmux can control a full-screen terminal inside the vmux host UI.
+    fn build_client_command(&mut self, session_name: &str) -> Result<Command, TmuxError>;
 }
 
 /// Real tmux adapter that shells out to the `tmux` binary.
@@ -65,10 +72,6 @@ impl RealTmuxAdapter {
             cmd.arg("-L").arg(socket);
         }
         cmd
-    }
-
-    fn inside_tmux(&self) -> bool {
-        env::var("TMUX").is_ok()
     }
 }
 
@@ -118,19 +121,11 @@ impl TmuxAdapter for RealTmuxAdapter {
         Ok(sessions)
     }
 
-    fn attach_or_switch(&mut self, session_name: &str) -> Result<(), TmuxError> {
+    fn build_client_command(&mut self, session_name: &str) -> Result<Command, TmuxError> {
         let mut cmd = self.base_command();
-        if self.inside_tmux() {
-            cmd.arg("switch-client").arg("-t").arg(session_name);
-        } else {
-            cmd.arg("attach-session").arg("-t").arg(session_name);
-        }
-        let status = cmd.status()?;
-        if !status.success() {
-            return Err(TmuxError::TmuxFailed(format!(
-                "tmux attach/switch exited with status {status}"
-            )));
-        }
-        Ok(())
+        // For the split-view host we always run a nested tmux client inside
+        // vmux's own PTY, so we consistently use `attach-session`.
+        cmd.arg("attach-session").arg("-t").arg(session_name);
+        Ok(cmd)
     }
 }

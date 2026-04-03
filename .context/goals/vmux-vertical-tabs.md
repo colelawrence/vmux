@@ -1,6 +1,6 @@
 # Goal: vmux session tabs
 
-**Give tmux a vertical session/tab experience so workspaces are easier to scan and use without changing tmux’s underlying role as the source of truth.**
+**Give tmux a persistent vertical session sidebar so workspaces are easier to scan and switch without changing tmux’s underlying role as the source of truth.**
 
 ## Motivators
 
@@ -11,12 +11,13 @@
 
 ## In Scope
 
-- The tmux session list as a vertical sidebar-like experience.
+- The tmux session list as a persistent vertical sidebar.
 - A single `vmux` entry point with no subcommands.
 - Visibility of the active session and attention-worthy sessions in a vertically arranged view.
 - Use of tmux’s existing session/window/pane state as the authoritative data source.
-- The user-facing workflow for entering, attaching to, and navigating tmux-backed workspaces through the vertical UI, all through the one `vmux` command.
+- The user-facing workflow for navigating and switching tmux-backed workspaces through the vertical UI, all through the one `vmux` command.
 - Sessions as the primary visible unit, rather than attempting to turn tmux windows or panes into the sidebar’s main abstraction.
+- A split-view host where the sidebar stays visible while the chosen session is shown alongside it.
 
 ## Out of Scope
 
@@ -25,6 +26,7 @@
 - Broader workspace orchestration beyond showing tmux sessions vertically.
 - Changing the user’s broader shell or terminal environment outside what is needed for this experience.
 - Making tmux windows or panes the primary visible unit in the sidebar.
+- Replacing tmux’s terminal behavior with a different multiplexer model.
 
 ## References
 

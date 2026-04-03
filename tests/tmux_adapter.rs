@@ -5,7 +5,7 @@ use vmux::{RealTmuxAdapter, TmuxAdapter};
 
 struct FakeTmux {
     sessions: Vec<TmuxSession>,
-    attached_to: std::cell::RefCell<Vec<String>>,
+    last_client: std::cell::RefCell<Vec<String>>,
 }
 
 impl FakeTmux {
@@ -18,7 +18,7 @@ impl FakeTmux {
                 attached: false,
             })
             .collect();
-        Self { sessions, attached_to: std::cell::RefCell::new(Vec::new()) }
+        Self { sessions, last_client: std::cell::RefCell::new(Vec::new()) }
     }
 }
 
@@ -27,20 +27,20 @@ impl TmuxAdapter for FakeTmux {
         Ok(self.sessions.clone())
     }
 
-    fn attach_or_switch(&mut self, session_name: &str) -> Result<(), vmux::tmux::TmuxError> {
-        self.attached_to.borrow_mut().push(session_name.to_string());
-        Ok(())
+    fn build_client_command(&mut self, session_name: &str) -> Result<std::process::Command, vmux::tmux::TmuxError> {
+        self.last_client.borrow_mut().push(session_name.to_string());
+        Ok(Command::new("tmux-client-placeholder"))
     }
 }
 
 #[test]
-fn fake_tmux_adapter_records_attach() {
+fn fake_tmux_adapter_records_client_build() {
     let mut fake = FakeTmux::new(&["one", "two"]);
     let sessions = fake.list_sessions().unwrap();
     assert_eq!(sessions.len(), 2);
 
-    fake.attach_or_switch("two").unwrap();
-    assert_eq!(fake.attached_to.borrow().as_slice(), &["two".to_string()]);
+    let _cmd = fake.build_client_command("two").unwrap();
+    assert_eq!(fake.last_client.borrow().as_slice(), &["two".to_string()]);
 }
 
 struct TmuxServerGuard {

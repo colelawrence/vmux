@@ -2,7 +2,7 @@ pub mod tmux;
 mod state;
 mod ui;
 
-pub use crate::state::{AppState, AppAction};
+pub use crate::state::AppState;
 pub use crate::tmux::{RealTmuxAdapter, TmuxAdapter, TmuxError, TmuxSession};
 
 /// Top-level vmux entry point used by `main`.

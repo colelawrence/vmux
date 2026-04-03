@@ -1,4 +1,4 @@
-use vmux::{AppAction, AppState, TmuxSession};
+use vmux::{AppState, TmuxSession};
 
 fn make_sessions_with_attached(names: &[(&str, bool)]) -> Vec<TmuxSession> {
     names
@@ -26,21 +26,6 @@ fn selection_wraps_around() {
 
     state.move_down();
     assert_eq!(state.selected, 0);
-}
-
-#[test]
-fn confirm_returns_attach_when_non_empty() {
-    let sessions = make_sessions(&["s1", "s2"]);
-    let state = AppState::new(sessions);
-    let action = state.confirm();
-    assert_eq!(action, Some(AppAction::Attach(0)));
-}
-
-#[test]
-fn confirm_none_when_empty() {
-    let sessions: Vec<TmuxSession> = Vec::new();
-    let state = AppState::new(sessions);
-    assert!(state.confirm().is_none());
 }
 
 #[test]
