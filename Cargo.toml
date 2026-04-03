@@ -12,3 +12,15 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+expectrl = "0.7"
+tempfile = "3"
+
+[lib]
+name = "vmux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vmux"
+path = "src/main.rs"
