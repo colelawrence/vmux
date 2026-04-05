@@ -50,7 +50,7 @@ fn split_view_renders_sidebar_and_embedded_tmux() {
 
     let log_path = dir.path().join("tmux_invocations.log");
     let script = format!(
-        "#!/bin/sh\nset -eu\n\nLOG=\"{}\"\n\necho \"tmux invoked: $0 $@\" >> \"$LOG\"\ncase \"$1\" in\n  list-sessions)\n    echo 's1:1:0'\n    echo 's2:1:0'\n    ;;\n  attach-session)\n    printf 'TMUX_SESSION:s1\\n'\n    sleep 2\n    ;;\n  *)\n    echo \"unexpected tmux command: $0 $@\" >> \"$LOG\"\n    ;;\n esac\n",
+        "#!/bin/sh\nset -eu\n\nLOG=\"{}\"\n\necho \"tmux invoked: $0 $@\" >> \"$LOG\"\ncase \"$1\" in\n  list-sessions)\n    echo 's1:1:0'\n    echo 's2:1:0'\n    ;;\n  attach-session)\n    printf '\\033[38;5;196mTMUX_SESSION:s1\\033[0m\\n'\n    sleep 2\n    ;;\n  *)\n    echo \"unexpected tmux command: $0 $@\" >> \"$LOG\"\n    ;;\n esac\n",
         log_path.display()
     );
 
@@ -67,11 +67,15 @@ fn split_view_renders_sidebar_and_embedded_tmux() {
 
     let mut pty = spawn_in_pty(cmd).expect("spawn vmux in pty");
 
-    pty.expect(Regex("sessions"))
-        .expect("sidebar should render");
-    pty.expect(Regex("TMUX_SESSION:s1"))
-        .expect("embedded tmux pane should render");
+    // The fake tmux client prints a colored sentinel line so we can prove the right-hand pane is live.
+    pty.expect(Regex("\\x1b\\[[0-9;]*mTMUX_SESSION:s1"))
+        .expect("embedded tmux pane should preserve tmux color output");
 
-    pty.send("q").expect("send quit");
+    // Tab switches to Sidebar, then bare q exercises the host-owned quit path.
+    pty.send("\tq").expect("send quit via sidebar focus");
     pty.expect(Eof).expect("vmux should exit cleanly");
+
+    let log = fs::read_to_string(&log_path).expect("read tmux invocation log");
+    assert!(log.contains("list-sessions"), "vmux should list tmux sessions");
+    assert!(log.contains("attach-session"), "vmux should attach the selected session");
 }

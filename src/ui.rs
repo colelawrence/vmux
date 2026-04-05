@@ -1,24 +1,28 @@
 use crate::state::AppState;
 use crate::tmux::TmuxAdapter;
 use crate::VmuxError;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 use std::io::{stdout, Read, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
-use vt100::Parser;
+use vt100::{Color as VtColor, Parser};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 struct TerminalCleanup {
     raw_enabled: bool,
     alt_screen_enabled: bool,
+    mouse_enabled: bool,
 }
 
 impl TerminalCleanup {
@@ -26,12 +30,17 @@ impl TerminalCleanup {
         Self {
             raw_enabled: false,
             alt_screen_enabled: false,
+            mouse_enabled: false,
         }
     }
 }
 
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
+        if self.mouse_enabled {
+            let mut stdout = stdout();
+            let _ = execute!(stdout, event::DisableMouseCapture);
+        }
         if self.alt_screen_enabled {
             let mut stdout = stdout();
             let _ = execute!(stdout, terminal::LeaveAlternateScreen);
@@ -59,6 +68,10 @@ impl TerminalGuard {
             .map_err(|e| VmuxError::Terminal(e.to_string()))?;
         cleanup.alt_screen_enabled = true;
 
+        execute!(stdout, event::EnableMouseCapture)
+            .map_err(|e| VmuxError::Terminal(e.to_string()))?;
+        cleanup.mouse_enabled = true;
+
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).map_err(|e| VmuxError::Terminal(e.to_string()))?;
         Ok(Self { terminal, cleanup })
@@ -83,6 +96,38 @@ struct TmuxPane {
 enum Focus {
     Sidebar,
     Pane,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostInputAction {
+    Quit,
+    ToggleFocus,
+    MoveUp,
+    MoveDown,
+    ForwardToTmux,
+    Ignore,
+}
+
+fn classify_key_event(focus: Focus, key: &crossterm::event::KeyEvent) -> HostInputAction {
+    use crossterm::event::KeyModifiers;
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q')) {
+        return HostInputAction::Quit;
+    }
+
+    match focus {
+        Focus::Sidebar => match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => HostInputAction::Quit,
+            KeyCode::Tab | KeyCode::Enter => HostInputAction::ToggleFocus,
+            KeyCode::Up | KeyCode::Char('k') => HostInputAction::MoveUp,
+            KeyCode::Down | KeyCode::Char('j') => HostInputAction::MoveDown,
+            _ => HostInputAction::Ignore,
+        },
+        Focus::Pane => match key.code {
+            KeyCode::Tab => HostInputAction::ToggleFocus,
+            _ => HostInputAction::ForwardToTmux,
+        },
+    }
 }
 
 impl TmuxPane {
@@ -184,7 +229,7 @@ impl TmuxPane {
                 pixel_height: 0,
             })
             .map_err(|e| VmuxError::Terminal(format!("resize tmux pane failed: {e}")))?;
-        self.parser = Parser::new(height as u16, width as u16, 0);
+        self.parser.set_size(height, width);
         Ok(())
     }
 
@@ -214,6 +259,172 @@ fn split_area(area: Rect) -> [Rect; 2] {
     [chunks[0], chunks[1]]
 }
 
+fn split_sidebar(area: Rect) -> [Rect; 2] {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+    [chunks[0], chunks[1]]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarMouseTarget {
+    Session(usize),
+    Exit,
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+fn sidebar_mouse_target_from_point(
+    sidebar_body: Rect,
+    exit_button: Rect,
+    mouse_col: u16,
+    mouse_row: u16,
+    sessions_len: usize,
+    session_offset: usize,
+) -> Option<SidebarMouseTarget> {
+    if rect_contains(exit_button, mouse_col, mouse_row) {
+        return Some(SidebarMouseTarget::Exit);
+    }
+
+    if sessions_len == 0 || !rect_contains(sidebar_body, mouse_col, mouse_row) {
+        return None;
+    }
+
+    let relative_row = mouse_row - sidebar_body.y;
+    let session_index = session_offset.saturating_add(relative_row as usize);
+    if session_index < sessions_len {
+        Some(SidebarMouseTarget::Session(session_index))
+    } else {
+        None
+    }
+}
+
+fn sync_sidebar_list_offset(
+    list_state: &mut ListState,
+    selected: usize,
+    visible_height: usize,
+    items_len: usize,
+) {
+    if visible_height == 0 || items_len == 0 {
+        return;
+    }
+
+    let max_offset = items_len.saturating_sub(visible_height);
+    let mut offset = list_state.offset().min(max_offset);
+    if selected < offset {
+        offset = selected;
+    }
+    if selected >= offset.saturating_add(visible_height) {
+        offset = selected.saturating_add(1).saturating_sub(visible_height);
+    }
+
+    *list_state.offset_mut() = offset.min(max_offset);
+}
+
+fn vt100_color_to_ratatui(color: VtColor) -> Color {
+    match color {
+        VtColor::Default => Color::Reset,
+        VtColor::Idx(index) => Color::Indexed(index),
+        VtColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+    }
+}
+
+fn style_from_cell(cell: &vt100::Cell) -> Style {
+    let mut style = Style::default();
+
+    match cell.fgcolor() {
+        VtColor::Default => {}
+        color => style = style.fg(vt100_color_to_ratatui(color)),
+    }
+    match cell.bgcolor() {
+        VtColor::Default => {}
+        color => style = style.bg(vt100_color_to_ratatui(color)),
+    }
+
+    if cell.bold() {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if cell.italic() {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if cell.underline() {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    if cell.inverse() {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+
+    style
+}
+
+fn screen_to_lines(screen: &vt100::Screen, width: u16, height: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(height as usize);
+
+    for row in 0..height {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(width as usize);
+        let mut current_style: Option<Style> = None;
+        let mut current_text = String::with_capacity(width as usize);
+
+        let push_run = |spans: &mut Vec<Span<'static>>, style: &mut Option<Style>, text: &mut String| {
+            if let Some(style) = style.take() {
+                spans.push(Span::styled(std::mem::take(text), style));
+            }
+        };
+
+        for col in 0..width {
+            let Some(cell) = screen.cell(row, col) else {
+                if let Some(style) = current_style {
+                    current_text.push(' ');
+                    current_style = Some(style);
+                } else {
+                    current_style = Some(Style::default());
+                    current_text.push(' ');
+                }
+                continue;
+            };
+
+            // vt100 stores wide glyphs in the leading cell and marks the trailing cell as a continuation.
+            // Skipping the continuation keeps the visible width aligned with the terminal buffer.
+            if cell.is_wide_continuation() {
+                continue;
+            }
+
+            let cell_style = style_from_cell(cell);
+            let cell_text = if cell.has_contents() {
+                cell.contents()
+            } else {
+                " ".to_string()
+            };
+
+            match current_style {
+                Some(style) if style == cell_style => {
+                    current_text.push_str(&cell_text);
+                }
+                Some(_) => {
+                    push_run(&mut spans, &mut current_style, &mut current_text);
+                    current_style = Some(cell_style);
+                    current_text = cell_text;
+                }
+                None => {
+                    current_style = Some(cell_style);
+                    current_text = cell_text;
+                }
+            }
+        }
+
+        push_run(&mut spans, &mut current_style, &mut current_text);
+        lines.push(Line::from(spans));
+    }
+
+    lines
+}
+
 fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Option<Vec<u8>> {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -229,11 +440,30 @@ fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Char(c) => c.to_string().into_bytes(),
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => vec![0x7f],
+        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::Home => b"\x1b[H".to_vec(),
+        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::PageUp => b"\x1b[5~".to_vec(),
+        KeyCode::PageDown => b"\x1b[6~".to_vec(),
         KeyCode::Left => b"\x1b[D".to_vec(),
         KeyCode::Right => b"\x1b[C".to_vec(),
         KeyCode::Up => b"\x1b[A".to_vec(),
         KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::F(1) => b"\x1bOP".to_vec(),
+        KeyCode::F(2) => b"\x1bOQ".to_vec(),
+        KeyCode::F(3) => b"\x1bOR".to_vec(),
+        KeyCode::F(4) => b"\x1bOS".to_vec(),
+        KeyCode::F(5) => b"\x1b[15~".to_vec(),
+        KeyCode::F(6) => b"\x1b[17~".to_vec(),
+        KeyCode::F(7) => b"\x1b[18~".to_vec(),
+        KeyCode::F(8) => b"\x1b[19~".to_vec(),
+        KeyCode::F(9) => b"\x1b[20~".to_vec(),
+        KeyCode::F(10) => b"\x1b[21~".to_vec(),
+        KeyCode::F(11) => b"\x1b[23~".to_vec(),
+        KeyCode::F(12) => b"\x1b[24~".to_vec(),
         KeyCode::Esc => b"\x1b".to_vec(),
         _ => return None,
     };
@@ -251,7 +481,7 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
     let mut guard = TerminalGuard::init()?;
     let mut state = AppState::new(sessions.clone());
     let mut list_state = ListState::default();
-    let mut focus = Focus::Sidebar;
+    let mut focus = Focus::Pane;
 
     // Initial tmux pane for the selected session.
     let mut tmux_pane: Option<TmuxPane> = None;
@@ -274,94 +504,75 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
         guard
             .terminal()
             .draw(|frame| {
+                let sidebar_chunks = split_sidebar(chunks[0]);
+                sync_sidebar_list_offset(
+                    &mut list_state,
+                    state.selected,
+                    sidebar_chunks[0].height as usize,
+                    state.sessions.len(),
+                );
                 list_state.select(Some(state.selected));
 
-                let sidebar_title = match focus {
-                    Focus::Sidebar => "sessions (sidebar)",
-                    Focus::Pane => "sessions",
-                };
+                let sidebar_body = sidebar_chunks[0];
+                let sidebar_exit = sidebar_chunks[1];
 
                 let items: Vec<ListItem> = state
                     .sessions
                     .iter()
-                    .enumerate()
-                    .map(|(index, s)| {
-                        let mut line = if index == state.selected {
-                            format!("> {}", s.name)
-                        } else {
-                            format!("  {}", s.name)
-                        };
+                    .map(|s| {
+                        let mut line = s.name.clone();
                         if s.attached {
                             line.push_str(" (attached)");
-                        }
-                        if index == state.selected {
-                            line.push_str(" *");
                         }
                         ListItem::new(line)
                     })
                     .collect();
 
                 let list = List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(sidebar_title))
                     .highlight_style(
                         Style::default()
                             .fg(Color::Cyan)
+                            .bg(Color::DarkGray)
                             .add_modifier(Modifier::BOLD),
                     )
-                    .highlight_symbol("> ");
+                    .highlight_symbol("▶ ");
 
-                frame.render_stateful_widget(list, chunks[0], &mut list_state);
+                frame.render_stateful_widget(list, sidebar_body, &mut list_state);
+
+                // The full footer row is clickable; the centered label is just the visual affordance.
+                let exit_button = Paragraph::new("[ Exit vmux ]")
+                    .alignment(Alignment::Center)
+                    .style(
+                        Style::default()
+                            .fg(Color::LightRed)
+                            .bg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                frame.render_widget(exit_button, sidebar_exit);
 
                 if let Some(ref mut pane) = tmux_pane {
                     pane_exited = pane.pump();
 
                     // Render the tmux screen into the right-hand pane.
-                    let mut lines = Vec::new();
-                    let screen = pane.parser.screen().clone();
-                    for row in 0..chunks[1].height {
-                        let mut line = String::new();
-                        for col in 0..chunks[1].width {
-                            if let Some(cell) = screen.cell(row, col) {
-                                let ch = cell.contents().to_string();
-                                if ch.is_empty() {
-                                    line.push(' ');
-                                } else {
-                                    line.push_str(&ch);
-                                }
-                            } else {
-                                line.push(' ');
-                            }
-                        }
-                        lines.push(line);
-                    }
-
-                    let title = match focus {
-                        Focus::Sidebar => "tmux (live)",
-                        Focus::Pane => "tmux (focused)",
-                    };
-                    let paragraph = Paragraph::new(lines.join("\n")).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(title),
-                    );
+                    // TODO: if this becomes a hot path, avoid rebuilding the entire pane every frame.
+                    let lines = screen_to_lines(pane.parser.screen(), chunks[1].width, chunks[1].height);
+                    let paragraph = Paragraph::new(lines);
                     frame.render_widget(paragraph, chunks[1]);
                 } else {
-                    let paragraph = Paragraph::new("no session").block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("tmux"),
-                    );
+                    let paragraph = Paragraph::new("no session");
                     frame.render_widget(paragraph, chunks[1]);
                 }
             })
             .map_err(|e| VmuxError::Terminal(e.to_string()))?;
 
         if pane_exited {
+            // A live embedded tmux client is part of the split-view contract.
             return Err(VmuxError::Terminal(
                 "embedded tmux client exited".to_string(),
             ));
         }
 
+        // Test-only escape hatch: let smoke tests stop after the first successful draw.
         if cfg!(debug_assertions)
             && std::env::var("VMUX_TEST_ONESHOT").as_deref() == Ok("1")
         {
@@ -372,40 +583,58 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
         {
             match event::read().map_err(|e| VmuxError::Terminal(e.to_string()))? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('q'))
-                    {
-                        break;
-                    }
-
-                    match focus {
-                        Focus::Sidebar => match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => break,
-                            KeyCode::Tab | KeyCode::Enter => {
-                                focus = Focus::Pane;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                state.move_up();
-                                tmux_pane = None; // respawn for the new selection
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                state.move_down();
-                                tmux_pane = None;
-                            }
-                            _ => {}
-                        },
-                        Focus::Pane => match key.code {
-                            KeyCode::Tab => {
-                                focus = Focus::Sidebar;
-                            }
-                            _ => {
-                                if let Some(ref mut pane) = tmux_pane {
-                                    if let Some(bytes) = key_event_to_bytes(&key) {
-                                        pane.send_input(&bytes)?;
-                                    }
+                    match classify_key_event(focus, &key) {
+                        HostInputAction::Quit => break,
+                        HostInputAction::ToggleFocus => {
+                            focus = match focus {
+                                Focus::Sidebar => Focus::Pane,
+                                Focus::Pane => Focus::Sidebar,
+                            };
+                        }
+                        HostInputAction::MoveUp => {
+                            state.move_up();
+                            tmux_pane = None; // respawn for the new selection
+                        }
+                        HostInputAction::MoveDown => {
+                            state.move_down();
+                            tmux_pane = None;
+                        }
+                        HostInputAction::ForwardToTmux => {
+                            if let Some(ref mut pane) = tmux_pane {
+                                if let Some(bytes) = key_event_to_bytes(&key) {
+                                    pane.send_input(&bytes)?;
                                 }
                             }
-                        },
+                        }
+                        HostInputAction::Ignore => {}
+                    }
+                }
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    ..
+                }) => {
+                    // Mouse hit testing uses the latest drawn sidebar geometry; resize updates are reflected on the next frame.
+                    let sidebar_chunks = split_sidebar(chunks[0]);
+                    match sidebar_mouse_target_from_point(
+                        sidebar_chunks[0],
+                        sidebar_chunks[1],
+                        column,
+                        row,
+                        state.sessions.len(),
+                        list_state.offset(),
+                    ) {
+                        Some(SidebarMouseTarget::Session(index)) => {
+                            // A single click both selects the session and returns keyboard focus to the pane.
+                            if index != state.selected {
+                                state.selected = index;
+                                tmux_pane = None;
+                            }
+                            focus = Focus::Pane;
+                        }
+                        Some(SidebarMouseTarget::Exit) => break,
+                        None => {}
                     }
                 }
                 Event::Resize(cols, rows) => {
@@ -421,4 +650,263 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn screen_to_lines_preserves_ansi_colors() {
+        let mut parser = Parser::new(1, 2, 0);
+        parser.process(b"\x1b[1;38;5;196;48;2;10;20;30mX\x1b[0mY");
+
+        let lines = screen_to_lines(parser.screen(), 2, 1);
+        let first = &lines[0].spans[0];
+        assert_eq!(first.content, "X");
+        assert_eq!(first.style.fg, Some(Color::Indexed(196)));
+        assert_eq!(first.style.bg, Some(Color::Rgb(10, 20, 30)));
+        assert!(first.style.add_modifier.contains(Modifier::BOLD));
+
+        let second = &lines[0].spans[1];
+        assert_eq!(second.content, "Y");
+        assert_eq!(second.style, Style::default());
+    }
+
+    #[test]
+    fn parser_resize_preserves_screen_contents() {
+        let mut parser = Parser::new(1, 4, 0);
+        parser.process(b"ABCD");
+        parser.set_size(2, 6);
+
+        let contents = parser.screen().contents_formatted();
+        assert!(
+            contents.windows(4).any(|window| window == b"ABCD"),
+            "resize should preserve the rendered buffer"
+        );
+    }
+
+    #[test]
+    fn sidebar_mouse_target_hits_session_rows_and_exit_footer() {
+        let sidebar_body = Rect::new(2, 1, 20, 5);
+        let sidebar_exit = Rect::new(2, 6, 20, 1);
+
+        assert_eq!(
+            sidebar_mouse_target_from_point(sidebar_body, sidebar_exit, 2, 1, 5, 0),
+            Some(SidebarMouseTarget::Session(0)),
+        );
+        assert_eq!(
+            sidebar_mouse_target_from_point(sidebar_body, sidebar_exit, 10, 5, 5, 0),
+            Some(SidebarMouseTarget::Session(4)),
+        );
+        assert_eq!(
+            sidebar_mouse_target_from_point(sidebar_body, sidebar_exit, 8, 6, 5, 0),
+            Some(SidebarMouseTarget::Exit),
+        );
+    }
+
+    #[test]
+    fn sidebar_mouse_target_ignores_out_of_bounds_clicks() {
+        let sidebar_body = Rect::new(2, 1, 20, 3);
+        let sidebar_exit = Rect::new(2, 4, 20, 1);
+
+        assert_eq!(
+            sidebar_mouse_target_from_point(sidebar_body, sidebar_exit, 1, 1, 3, 0),
+            None,
+        );
+        assert_eq!(
+            sidebar_mouse_target_from_point(sidebar_body, sidebar_exit, 25, 1, 3, 0),
+            None,
+        );
+        assert_eq!(
+            sidebar_mouse_target_from_point(sidebar_body, sidebar_exit, 10, 5, 3, 0),
+            None,
+        );
+        assert_eq!(
+            sidebar_mouse_target_from_point(sidebar_body, sidebar_exit, 5, 3, 0, 0),
+            None,
+        );
+    }
+
+    #[test]
+    fn sidebar_mouse_target_applies_list_offset() {
+        let sidebar_body = Rect::new(2, 1, 20, 3);
+        let sidebar_exit = Rect::new(2, 4, 20, 1);
+
+        assert_eq!(
+            sidebar_mouse_target_from_point(sidebar_body, sidebar_exit, 8, 2, 10, 3),
+            Some(SidebarMouseTarget::Session(4)),
+        );
+        assert_eq!(
+            sidebar_mouse_target_from_point(sidebar_body, sidebar_exit, 8, 3, 4, 3),
+            None,
+        );
+    }
+
+    #[test]
+    fn sidebar_list_offset_keeps_selected_row_visible() {
+        let mut state = ListState::default().with_offset(0);
+        sync_sidebar_list_offset(&mut state, 5, 3, 10);
+        assert_eq!(state.offset(), 3);
+        sync_sidebar_list_offset(&mut state, 1, 3, 10);
+        assert_eq!(state.offset(), 1);
+    }
+
+    #[test]
+    fn sidebar_key_routing_matches_host_contract() {
+        assert_eq!(
+            classify_key_event(
+                Focus::Sidebar,
+                &KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
+            ),
+            HostInputAction::Quit,
+        );
+        assert_eq!(
+            classify_key_event(
+                Focus::Sidebar,
+                &KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            ),
+            HostInputAction::Quit,
+        );
+        assert_eq!(
+            classify_key_event(
+                Focus::Sidebar,
+                &KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            ),
+            HostInputAction::ToggleFocus,
+        );
+        assert_eq!(
+            classify_key_event(Focus::Sidebar, &KeyEvent::new(KeyCode::Up, KeyModifiers::empty())),
+            HostInputAction::MoveUp,
+        );
+        assert_eq!(
+            classify_key_event(
+                Focus::Sidebar,
+                &KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            ),
+            HostInputAction::MoveDown,
+        );
+    }
+
+    #[test]
+    fn pane_key_routing_passes_through_most_keys() {
+        assert_eq!(
+            classify_key_event(
+                Focus::Pane,
+                &KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
+            ),
+            HostInputAction::ForwardToTmux,
+        );
+        assert_eq!(
+            classify_key_event(Focus::Pane, &KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+            HostInputAction::ForwardToTmux,
+        );
+        assert_eq!(
+            classify_key_event(Focus::Pane, &KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())),
+            HostInputAction::ToggleFocus,
+        );
+        assert_eq!(
+            classify_key_event(
+                Focus::Pane,
+                &KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
+            ),
+            HostInputAction::ForwardToTmux,
+        );
+        assert_eq!(
+            classify_key_event(
+                Focus::Pane,
+                &KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            ),
+            HostInputAction::Quit,
+        );
+    }
+
+    #[test]
+    fn key_event_to_bytes_matches_tmux_friendly_sequences() {
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty())),
+            Some(vec![b'a']),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Char('A'), KeyModifiers::CONTROL)),
+            Some(vec![1]),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            Some(vec![26]),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())),
+            Some(b"\r".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())),
+            Some(b"\t".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty())),
+            Some(b"\x1b[Z".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty())),
+            Some(vec![0x7f]),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Insert, KeyModifiers::empty())),
+            Some(b"\x1b[2~".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Delete, KeyModifiers::empty())),
+            Some(b"\x1b[3~".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Home, KeyModifiers::empty())),
+            Some(b"\x1b[H".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::End, KeyModifiers::empty())),
+            Some(b"\x1b[F".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty())),
+            Some(b"\x1b[5~".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty())),
+            Some(b"\x1b[6~".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Left, KeyModifiers::empty())),
+            Some(b"\x1b[D".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Right, KeyModifiers::empty())),
+            Some(b"\x1b[C".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::empty())),
+            Some(b"\x1b[A".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Down, KeyModifiers::empty())),
+            Some(b"\x1b[B".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::F(1), KeyModifiers::empty())),
+            Some(b"\x1bOP".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::F(4), KeyModifiers::empty())),
+            Some(b"\x1bOS".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::F(12), KeyModifiers::empty())),
+            Some(b"\x1b[24~".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+            Some(b"\x1b".to_vec()),
+        );
+    }
 }
