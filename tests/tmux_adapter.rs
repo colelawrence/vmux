@@ -1,10 +1,11 @@
 use std::process::Command;
 
-use vmux::tmux::TmuxSession;
+use vmux::tmux::{TmuxBellWindow, TmuxSession};
 use vmux::{RealTmuxAdapter, TmuxAdapter};
 
 struct FakeTmux {
     sessions: Vec<TmuxSession>,
+    bell_windows: Vec<TmuxBellWindow>,
     last_client: std::cell::RefCell<Vec<String>>,
 }
 
@@ -18,13 +19,27 @@ impl FakeTmux {
                 attached: false,
             })
             .collect();
-        Self { sessions, last_client: std::cell::RefCell::new(Vec::new()) }
+        Self {
+            sessions,
+            bell_windows: Vec::new(),
+            last_client: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn with_bell_windows(names: &[&str], bell_windows: Vec<TmuxBellWindow>) -> Self {
+        let mut fake = Self::new(names);
+        fake.bell_windows = bell_windows;
+        fake
     }
 }
 
 impl TmuxAdapter for FakeTmux {
     fn list_sessions(&mut self) -> Result<Vec<TmuxSession>, vmux::tmux::TmuxError> {
         Ok(self.sessions.clone())
+    }
+
+    fn list_bell_windows(&mut self) -> Result<Vec<TmuxBellWindow>, vmux::tmux::TmuxError> {
+        Ok(self.bell_windows.clone())
     }
 
     fn build_client_command(&mut self, session_name: &str) -> Result<std::process::Command, vmux::tmux::TmuxError> {
@@ -41,6 +56,22 @@ fn fake_tmux_adapter_records_client_build() {
 
     let _cmd = fake.build_client_command("two").unwrap();
     assert_eq!(fake.last_client.borrow().as_slice(), &["two".to_string()]);
+}
+
+#[test]
+fn fake_tmux_adapter_returns_bell_windows() {
+    let mut fake = FakeTmux::with_bell_windows(
+        &["one", "two"],
+        vec![TmuxBellWindow {
+            session_name: "one".to_string(),
+            window_id: "@1".to_string(),
+        }],
+    );
+
+    let bell_windows = fake.list_bell_windows().unwrap();
+    assert_eq!(bell_windows.len(), 1);
+    assert_eq!(bell_windows[0].session_name, "one");
+    assert_eq!(bell_windows[0].window_id, "@1");
 }
 
 struct TmuxServerGuard {

@@ -9,6 +9,12 @@ pub struct TmuxSession {
     pub attached: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxBellWindow {
+    pub session_name: String,
+    pub window_id: String,
+}
+
 #[derive(Debug)]
 pub enum TmuxError {
     Io(std::io::Error),
@@ -46,6 +52,9 @@ impl From<std::string::FromUtf8Error> for TmuxError {
 pub trait TmuxAdapter {
     /// List all tmux sessions.
     fn list_sessions(&mut self) -> Result<Vec<TmuxSession>, TmuxError>;
+
+    /// List windows currently flagged as having a bell.
+    fn list_bell_windows(&mut self) -> Result<Vec<TmuxBellWindow>, TmuxError>;
 
     /// Build a tmux client command that attaches to the given session.
     ///
@@ -119,6 +128,43 @@ impl TmuxAdapter for RealTmuxAdapter {
             });
         }
         Ok(sessions)
+    }
+
+    fn list_bell_windows(&mut self) -> Result<Vec<TmuxBellWindow>, TmuxError> {
+        // Format: session_name:window_id:bell_flag
+        let mut cmd = self.base_command();
+        cmd.arg("list-windows")
+            .arg("-a")
+            .arg("-F")
+            .arg("#S:#{window_id}:#{window_bell_flag}");
+        let output = cmd.output()?;
+        if !output.status.success() {
+            return Err(TmuxError::TmuxFailed(format!(
+                "tmux list-windows exited with status {status}",
+                status = output.status
+            )));
+        }
+        let stdout = String::from_utf8(output.stdout)?;
+        let mut windows = Vec::new();
+        for line in stdout.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() < 3 {
+                return Err(TmuxError::Parse(format!(
+                    "unexpected list-windows line: {line}"
+                )));
+            }
+            if parts[2] != "1" {
+                continue;
+            }
+            windows.push(TmuxBellWindow {
+                session_name: parts[0].to_string(),
+                window_id: parts[1].to_string(),
+            });
+        }
+        Ok(windows)
     }
 
     fn build_client_command(&mut self, session_name: &str) -> Result<Command, TmuxError> {

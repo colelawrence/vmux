@@ -50,7 +50,7 @@ fn split_view_renders_sidebar_and_embedded_tmux() {
 
     let log_path = dir.path().join("tmux_invocations.log");
     let script = format!(
-        "#!/bin/sh\nset -eu\n\nLOG=\"{}\"\n\necho \"tmux invoked: $0 $@\" >> \"$LOG\"\ncase \"$1\" in\n  list-sessions)\n    echo 's1:1:0'\n    echo 's2:1:0'\n    ;;\n  attach-session)\n    printf '\\033[38;5;196mTMUX_SESSION:s1\\033[0m\\n'\n    # This fake client is intentionally short-lived: it reads one byte so the test can\n    # verify passthrough, then exits to exercise the embedded-client shutdown path.\n    stty raw -echo\n    key=\"$(dd bs=1 count=1 2>/dev/null | od -An -t x1 | tr -d ' \\n')\"\n    printf 'KEY:%s\\n' \"$key\" >> \"$LOG\"\n    ;;\n  *)\n    echo \"unexpected tmux command: $0 $@\" >> \"$LOG\"\n    ;;\n esac\n",
+        "#!/bin/sh\nset -eu\n\nLOG=\"{}\"\n\necho \"tmux invoked: $0 $@\" >> \"$LOG\"\ncase \"$1\" in\n  list-sessions)\n    echo 's1:1:0'\n    echo 's2:1:0'\n    ;;\n  list-windows)\n    echo 's1:@0:1'\n    ;;\n  attach-session)\n    printf '\\033[38;5;196mTMUX_SESSION:s1\\033[0m\\n'\n    # This fake client is intentionally short-lived: it reads one byte so the test can\n    # verify passthrough, then exits to exercise the embedded-client shutdown path.\n    stty raw -echo\n    key=\"$(dd bs=1 count=1 2>/dev/null | od -An -t x1 | tr -d ' \\n')\"\n    printf 'KEY:%s\\n' \"$key\" >> \"$LOG\"\n    ;;\n  *)\n    echo \"unexpected tmux command: $0 $@\" >> \"$LOG\"\n    ;;\n esac\n",
         log_path.display()
     );
 
@@ -77,6 +77,7 @@ fn split_view_renders_sidebar_and_embedded_tmux() {
 
     let log = fs::read_to_string(&log_path).expect("read tmux invocation log");
     assert!(log.contains("list-sessions"), "vmux should list tmux sessions");
+    assert!(log.contains("list-windows"), "vmux should poll tmux bell state");
     assert!(log.contains("attach-session"), "vmux should attach the selected session");
     assert!(log.contains("KEY:71"), "q should be forwarded to tmux, not intercepted by vmux");
 }

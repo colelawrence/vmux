@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use crate::tmux::TmuxAdapter;
+use crate::tmux::{TmuxAdapter, TmuxSession};
 use crate::VmuxError;
 use crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -13,7 +13,7 @@ use ratatui::Terminal;
 use std::io::{stdout, Read, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use vt100::{Color as VtColor, Parser};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
@@ -209,6 +209,26 @@ impl Drop for TmuxPane {
         let _ = self._child.kill();
         let _ = self._child.wait();
     }
+}
+
+const RECENT_BELL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+fn session_label_line(session: &TmuxSession, recent_bell_count: usize) -> Line<'static> {
+    let mut spans = Vec::with_capacity(4);
+    spans.push(Span::raw(session.name.clone()));
+    if session.attached {
+        spans.push(Span::raw(" (attached)"));
+    }
+    if recent_bell_count > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("!{recent_bell_count}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn split_area(area: Rect) -> [Rect; 2] {
@@ -571,12 +591,22 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
     let mut guard = TerminalGuard::init()?;
     let mut state = AppState::new(sessions.clone());
     let mut list_state = ListState::default();
+    state.observe_bell_windows(
+        adapter.list_bell_windows()?,
+        SystemTime::now(),
+    );
+    let mut last_bell_poll = Instant::now();
 
     // Initial tmux pane for the selected session.
     let mut tmux_pane: Option<TmuxPane> = None;
     let mut tmux_mouse_captured = false;
 
     loop {
+        if last_bell_poll.elapsed() >= RECENT_BELL_POLL_INTERVAL {
+            state.observe_bell_windows(adapter.list_bell_windows()?, SystemTime::now());
+            last_bell_poll = Instant::now();
+        }
+
         let size = guard
             .terminal()
             .size()
@@ -610,13 +640,7 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
                 let items: Vec<ListItem> = state
                     .sessions
                     .iter()
-                    .map(|s| {
-                        let mut line = s.name.clone();
-                        if s.attached {
-                            line.push_str(" (attached)");
-                        }
-                        ListItem::new(line)
-                    })
+                    .map(|s| ListItem::new(session_label_line(s, state.recent_bell_count(&s.name))))
                     .collect();
 
                 let list = List::new(items)
@@ -784,6 +808,23 @@ mod tests {
         let chunks = split_area(Rect::new(0, 0, 100, 10));
         assert_eq!(chunks[0], Rect::new(0, 0, 76, 10));
         assert_eq!(chunks[1], Rect::new(76, 0, 24, 10));
+    }
+
+    #[test]
+    fn session_label_line_shows_recent_bell_badge() {
+        let session = TmuxSession {
+            name: "demo".to_string(),
+            windows: Some(2),
+            attached: true,
+        };
+
+        let line = session_label_line(&session, 2);
+        assert_eq!(line.spans[0].content, "demo");
+        assert_eq!(line.spans[1].content, " (attached)");
+        assert_eq!(line.spans[2].content, " ");
+        assert_eq!(line.spans[3].content, "!2");
+        assert_eq!(line.spans[3].style.fg, Some(Color::Yellow));
+        assert!(line.spans[3].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
