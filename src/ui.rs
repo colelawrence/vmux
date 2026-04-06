@@ -1,9 +1,7 @@
 use crate::state::AppState;
 use crate::tmux::TmuxAdapter;
 use crate::VmuxError;
-use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
@@ -90,44 +88,6 @@ struct TmuxPane {
     _child: Box<dyn Child + Send>,
     _writer: Box<dyn Write + Send>,
     exited: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    Sidebar,
-    Pane,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostInputAction {
-    Quit,
-    ToggleFocus,
-    MoveUp,
-    MoveDown,
-    ForwardToTmux,
-    Ignore,
-}
-
-fn classify_key_event(focus: Focus, key: &crossterm::event::KeyEvent) -> HostInputAction {
-    use crossterm::event::KeyModifiers;
-
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q')) {
-        return HostInputAction::Quit;
-    }
-
-    match focus {
-        Focus::Sidebar => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => HostInputAction::Quit,
-            KeyCode::Tab | KeyCode::Enter => HostInputAction::ToggleFocus,
-            KeyCode::Up | KeyCode::Char('k') => HostInputAction::MoveUp,
-            KeyCode::Down | KeyCode::Char('j') => HostInputAction::MoveDown,
-            _ => HostInputAction::Ignore,
-        },
-        Focus::Pane => match key.code {
-            KeyCode::Tab => HostInputAction::ToggleFocus,
-            _ => HostInputAction::ForwardToTmux,
-        },
-    }
 }
 
 impl TmuxPane {
@@ -254,7 +214,7 @@ impl Drop for TmuxPane {
 fn split_area(area: Rect) -> [Rect; 2] {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(24), Constraint::Min(1)])
+        .constraints([Constraint::Min(1), Constraint::Length(24)])
         .split(area);
     [chunks[0], chunks[1]]
 }
@@ -303,6 +263,55 @@ fn sidebar_mouse_target_from_point(
     } else {
         None
     }
+}
+
+fn tmux_mouse_button_code(button: MouseButton) -> u16 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+fn tmux_mouse_modifiers(modifiers: crossterm::event::KeyModifiers) -> u16 {
+    let mut code = 0;
+    if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+        code |= 0b0000_0100;
+    }
+    if modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+        code |= 0b0000_1000;
+    }
+    if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        code |= 0b0001_0000;
+    }
+    code
+}
+
+fn tmux_mouse_event_to_bytes(event: &MouseEvent, pane: Rect) -> Option<Vec<u8>> {
+    if !rect_contains(pane, event.column, event.row) {
+        return None;
+    }
+
+    let x = event.column.saturating_sub(pane.x).saturating_add(1);
+    let y = event.row.saturating_sub(pane.y).saturating_add(1);
+    let suffix = match event.kind {
+        MouseEventKind::Down(_) | MouseEventKind::Drag(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => 'M',
+        MouseEventKind::Up(_) => 'm',
+        MouseEventKind::Moved => return None,
+    };
+
+    let cb = match event.kind {
+        MouseEventKind::Down(button) => tmux_mouse_button_code(button),
+        MouseEventKind::Up(_) => 3,
+        MouseEventKind::Drag(button) => 0b0010_0000 | tmux_mouse_button_code(button),
+        MouseEventKind::Moved => return None,
+        MouseEventKind::ScrollUp => 0b0100_0000,
+        MouseEventKind::ScrollDown => 0b0100_0001,
+        MouseEventKind::ScrollLeft => 0b0100_0010,
+        MouseEventKind::ScrollRight => 0b0100_0011,
+    } | tmux_mouse_modifiers(event.modifiers);
+
+    Some(format!("\x1b[<{};{};{}{}", cb, x, y, suffix).into_bytes())
 }
 
 fn sync_sidebar_list_offset(
@@ -425,45 +434,126 @@ fn screen_to_lines(screen: &vt100::Screen, width: u16, height: u16) -> Vec<Line<
     lines
 }
 
+fn control_code(c: char) -> Option<u8> {
+    if !c.is_ascii() {
+        return None;
+    }
+
+    if c == '?' {
+        return Some(0x7f);
+    }
+
+    Some((c as u8) & 0x1f)
+}
+
+fn key_modifier_value(modifiers: crossterm::event::KeyModifiers) -> Option<u8> {
+    use crossterm::event::KeyModifiers;
+
+    let shift = u8::from(modifiers.contains(KeyModifiers::SHIFT));
+    let alt_like = u8::from(modifiers.intersects(
+        KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SUPER | KeyModifiers::HYPER,
+    ));
+    let control = u8::from(modifiers.contains(KeyModifiers::CONTROL));
+
+    if shift == 0 && alt_like == 0 && control == 0 {
+        None
+    } else {
+        Some(1 + shift + (alt_like * 2) + (control * 4))
+    }
+}
+
+fn has_escape_prefix(modifiers: crossterm::event::KeyModifiers) -> bool {
+    use crossterm::event::KeyModifiers;
+
+    modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SUPER | KeyModifiers::HYPER)
+}
+
+fn modified_csi_sequence(
+    parameter: u8,
+    final_char: char,
+    modifiers: crossterm::event::KeyModifiers,
+) -> Option<Vec<u8>> {
+    key_modifier_value(modifiers).map(|modifier| {
+        format!("\x1b[{parameter};{modifier}{final_char}").into_bytes()
+    })
+}
+
 fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Option<Vec<u8>> {
     use crossterm::event::{KeyCode, KeyModifiers};
 
     let bytes = match key.code {
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let ch = c.to_ascii_lowercase();
-            if ('a'..='z').contains(&ch) {
-                vec![(ch as u8) - b'a' + 1]
-            } else {
-                return None;
+            let mut bytes = vec![control_code(c)?];
+            if has_escape_prefix(key.modifiers) {
+                bytes.insert(0, 0x1b);
             }
+            bytes
         }
-        KeyCode::Char(c) => c.to_string().into_bytes(),
+        KeyCode::Char(c) => {
+            let mut bytes = c.to_string().into_bytes();
+            if has_escape_prefix(key.modifiers) {
+                bytes.insert(0, 0x1b);
+            }
+            bytes
+        }
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
-        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::BackTab => {
+            if let Some(modifier) = key_modifier_value(key.modifiers) {
+                if modifier == 2 {
+                    b"\x1b[Z".to_vec()
+                } else {
+                    format!("\x1b[1;{modifier}Z").into_bytes()
+                }
+            } else {
+                b"\x1b[Z".to_vec()
+            }
+        }
         KeyCode::Backspace => vec![0x7f],
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::F(1) => b"\x1bOP".to_vec(),
-        KeyCode::F(2) => b"\x1bOQ".to_vec(),
-        KeyCode::F(3) => b"\x1bOR".to_vec(),
-        KeyCode::F(4) => b"\x1bOS".to_vec(),
-        KeyCode::F(5) => b"\x1b[15~".to_vec(),
-        KeyCode::F(6) => b"\x1b[17~".to_vec(),
-        KeyCode::F(7) => b"\x1b[18~".to_vec(),
-        KeyCode::F(8) => b"\x1b[19~".to_vec(),
-        KeyCode::F(9) => b"\x1b[20~".to_vec(),
-        KeyCode::F(10) => b"\x1b[21~".to_vec(),
-        KeyCode::F(11) => b"\x1b[23~".to_vec(),
-        KeyCode::F(12) => b"\x1b[24~".to_vec(),
+        KeyCode::Insert => modified_csi_sequence(2, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[2~".to_vec()),
+        KeyCode::Delete => modified_csi_sequence(3, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[3~".to_vec()),
+        KeyCode::Home => modified_csi_sequence(1, 'H', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[H".to_vec()),
+        KeyCode::End => modified_csi_sequence(1, 'F', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[F".to_vec()),
+        KeyCode::PageUp => modified_csi_sequence(5, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => modified_csi_sequence(6, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[6~".to_vec()),
+        KeyCode::Left => modified_csi_sequence(1, 'D', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[D".to_vec()),
+        KeyCode::Right => modified_csi_sequence(1, 'C', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[C".to_vec()),
+        KeyCode::Up => modified_csi_sequence(1, 'A', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[A".to_vec()),
+        KeyCode::Down => modified_csi_sequence(1, 'B', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[B".to_vec()),
+        KeyCode::F(1) => modified_csi_sequence(1, 'P', key.modifiers)
+            .unwrap_or_else(|| b"\x1bOP".to_vec()),
+        KeyCode::F(2) => modified_csi_sequence(1, 'Q', key.modifiers)
+            .unwrap_or_else(|| b"\x1bOQ".to_vec()),
+        KeyCode::F(3) => modified_csi_sequence(1, 'R', key.modifiers)
+            .unwrap_or_else(|| b"\x1bOR".to_vec()),
+        KeyCode::F(4) => modified_csi_sequence(1, 'S', key.modifiers)
+            .unwrap_or_else(|| b"\x1bOS".to_vec()),
+        KeyCode::F(5) => modified_csi_sequence(15, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[15~".to_vec()),
+        KeyCode::F(6) => modified_csi_sequence(17, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[17~".to_vec()),
+        KeyCode::F(7) => modified_csi_sequence(18, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[18~".to_vec()),
+        KeyCode::F(8) => modified_csi_sequence(19, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[19~".to_vec()),
+        KeyCode::F(9) => modified_csi_sequence(20, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[20~".to_vec()),
+        KeyCode::F(10) => modified_csi_sequence(21, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[21~".to_vec()),
+        KeyCode::F(11) => modified_csi_sequence(23, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[23~".to_vec()),
+        KeyCode::F(12) => modified_csi_sequence(24, '~', key.modifiers)
+            .unwrap_or_else(|| b"\x1b[24~".to_vec()),
         KeyCode::Esc => b"\x1b".to_vec(),
         _ => return None,
     };
@@ -481,10 +571,10 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
     let mut guard = TerminalGuard::init()?;
     let mut state = AppState::new(sessions.clone());
     let mut list_state = ListState::default();
-    let mut focus = Focus::Pane;
 
     // Initial tmux pane for the selected session.
     let mut tmux_pane: Option<TmuxPane> = None;
+    let mut tmux_mouse_captured = false;
 
     loop {
         let size = guard
@@ -496,7 +586,8 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
 
         if tmux_pane.is_none() && !state.sessions.is_empty() {
             let selected = &state.sessions[state.selected];
-            tmux_pane = Some(TmuxPane::spawn(adapter, &selected.name, chunks[1])?);
+            // Size the embedded tmux client to the pane that actually renders tmux output.
+            tmux_pane = Some(TmuxPane::spawn(adapter, &selected.name, chunks[0])?);
         }
 
         let mut pane_exited = false;
@@ -504,7 +595,7 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
         guard
             .terminal()
             .draw(|frame| {
-                let sidebar_chunks = split_sidebar(chunks[0]);
+                let sidebar_chunks = split_sidebar(chunks[1]);
                 sync_sidebar_list_offset(
                     &mut list_state,
                     state.selected,
@@ -553,14 +644,14 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
                 if let Some(ref mut pane) = tmux_pane {
                     pane_exited = pane.pump();
 
-                    // Render the tmux screen into the right-hand pane.
+                    // Render the tmux screen into the left-hand pane.
                     // TODO: if this becomes a hot path, avoid rebuilding the entire pane every frame.
-                    let lines = screen_to_lines(pane.parser.screen(), chunks[1].width, chunks[1].height);
+                    let lines = screen_to_lines(pane.parser.screen(), chunks[0].width, chunks[0].height);
                     let paragraph = Paragraph::new(lines);
-                    frame.render_widget(paragraph, chunks[1]);
+                    frame.render_widget(paragraph, chunks[0]);
                 } else {
                     let paragraph = Paragraph::new("no session");
-                    frame.render_widget(paragraph, chunks[1]);
+                    frame.render_widget(paragraph, chunks[0]);
                 }
             })
             .map_err(|e| VmuxError::Terminal(e.to_string()))?;
@@ -583,65 +674,66 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
         {
             match event::read().map_err(|e| VmuxError::Terminal(e.to_string()))? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    match classify_key_event(focus, &key) {
-                        HostInputAction::Quit => break,
-                        HostInputAction::ToggleFocus => {
-                            focus = match focus {
-                                Focus::Sidebar => Focus::Pane,
-                                Focus::Pane => Focus::Sidebar,
-                            };
+                    if let Some(ref mut pane) = tmux_pane {
+                        if let Some(bytes) = key_event_to_bytes(&key) {
+                            pane.send_input(&bytes)?;
                         }
-                        HostInputAction::MoveUp => {
-                            state.move_up();
-                            tmux_pane = None; // respawn for the new selection
-                        }
-                        HostInputAction::MoveDown => {
-                            state.move_down();
-                            tmux_pane = None;
-                        }
-                        HostInputAction::ForwardToTmux => {
-                            if let Some(ref mut pane) = tmux_pane {
-                                if let Some(bytes) = key_event_to_bytes(&key) {
-                                    pane.send_input(&bytes)?;
-                                }
-                            }
-                        }
-                        HostInputAction::Ignore => {}
                     }
                 }
-                Event::Mouse(MouseEvent {
-                    kind: MouseEventKind::Down(MouseButton::Left),
-                    column,
-                    row,
-                    ..
-                }) => {
+                Event::Mouse(mouse) => {
                     // Mouse hit testing uses the latest drawn sidebar geometry; resize updates are reflected on the next frame.
-                    let sidebar_chunks = split_sidebar(chunks[0]);
+                    let sidebar_chunks = split_sidebar(chunks[1]);
                     match sidebar_mouse_target_from_point(
                         sidebar_chunks[0],
                         sidebar_chunks[1],
-                        column,
-                        row,
+                        mouse.column,
+                        mouse.row,
                         state.sessions.len(),
                         list_state.offset(),
                     ) {
-                        Some(SidebarMouseTarget::Session(index)) => {
-                            // A single click both selects the session and returns keyboard focus to the pane.
+                        Some(SidebarMouseTarget::Session(index))
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                        {
                             if index != state.selected {
                                 state.selected = index;
                                 tmux_pane = None;
                             }
-                            focus = Focus::Pane;
+                            tmux_mouse_captured = false;
                         }
-                        Some(SidebarMouseTarget::Exit) => break,
-                        None => {}
+                        Some(SidebarMouseTarget::Exit)
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
+                        {
+                            break;
+                        }
+                        _ if rect_contains(chunks[0], mouse.column, mouse.row) || tmux_mouse_captured => {
+                            if let Some(ref mut pane) = tmux_pane {
+                                if let Some(bytes) = tmux_mouse_event_to_bytes(&mouse, chunks[0]) {
+                                    pane.send_input(&bytes)?;
+                                    match mouse.kind {
+                                        MouseEventKind::Down(_) => tmux_mouse_captured = true,
+                                        MouseEventKind::Up(_) => tmux_mouse_captured = false,
+                                        MouseEventKind::ScrollUp
+                                        | MouseEventKind::ScrollDown
+                                        | MouseEventKind::ScrollLeft
+                                        | MouseEventKind::ScrollRight
+                                        | MouseEventKind::Moved
+                                        | MouseEventKind::Drag(_) => {}
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                                tmux_mouse_captured = false;
+                            }
+                        }
                     }
                 }
                 Event::Resize(cols, rows) => {
                     let area = Rect::new(0, 0, cols, rows);
                     let chunks = split_area(area);
                     if let Some(ref mut pane) = tmux_pane {
-                        pane.resize(chunks[1].width, chunks[1].height)?;
+                        pane.resize(chunks[0].width, chunks[0].height)?;
                     }
                 }
                 _ => {}
@@ -655,7 +747,7 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     #[test]
     fn screen_to_lines_preserves_ansi_colors() {
@@ -685,6 +777,13 @@ mod tests {
             contents.windows(4).any(|window| window == b"ABCD"),
             "resize should preserve the rendered buffer"
         );
+    }
+
+    #[test]
+    fn split_area_places_sidebar_on_right() {
+        let chunks = split_area(Rect::new(0, 0, 100, 10));
+        assert_eq!(chunks[0], Rect::new(0, 0, 76, 10));
+        assert_eq!(chunks[1], Rect::new(76, 0, 24, 10));
     }
 
     #[test]
@@ -754,75 +853,6 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_key_routing_matches_host_contract() {
-        assert_eq!(
-            classify_key_event(
-                Focus::Sidebar,
-                &KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
-            ),
-            HostInputAction::Quit,
-        );
-        assert_eq!(
-            classify_key_event(
-                Focus::Sidebar,
-                &KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
-            ),
-            HostInputAction::Quit,
-        );
-        assert_eq!(
-            classify_key_event(
-                Focus::Sidebar,
-                &KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
-            ),
-            HostInputAction::ToggleFocus,
-        );
-        assert_eq!(
-            classify_key_event(Focus::Sidebar, &KeyEvent::new(KeyCode::Up, KeyModifiers::empty())),
-            HostInputAction::MoveUp,
-        );
-        assert_eq!(
-            classify_key_event(
-                Focus::Sidebar,
-                &KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
-            ),
-            HostInputAction::MoveDown,
-        );
-    }
-
-    #[test]
-    fn pane_key_routing_passes_through_most_keys() {
-        assert_eq!(
-            classify_key_event(
-                Focus::Pane,
-                &KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
-            ),
-            HostInputAction::ForwardToTmux,
-        );
-        assert_eq!(
-            classify_key_event(Focus::Pane, &KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
-            HostInputAction::ForwardToTmux,
-        );
-        assert_eq!(
-            classify_key_event(Focus::Pane, &KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())),
-            HostInputAction::ToggleFocus,
-        );
-        assert_eq!(
-            classify_key_event(
-                Focus::Pane,
-                &KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
-            ),
-            HostInputAction::ForwardToTmux,
-        );
-        assert_eq!(
-            classify_key_event(
-                Focus::Pane,
-                &KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-            ),
-            HostInputAction::Quit,
-        );
-    }
-
-    #[test]
     fn key_event_to_bytes_matches_tmux_friendly_sequences() {
         assert_eq!(
             key_event_to_bytes(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty())),
@@ -835,6 +865,22 @@ mod tests {
         assert_eq!(
             key_event_to_bytes(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
             Some(vec![26]),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Char('['), KeyModifiers::CONTROL)),
+            Some(vec![27]),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)),
+            Some(b"\x1ba".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            Some(b"\x1b[1;3A".to_vec()),
+        );
+        assert_eq!(
+            key_event_to_bytes(&KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)),
+            Some(b"\x1b[1;5C".to_vec()),
         );
         assert_eq!(
             key_event_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())),
@@ -907,6 +953,48 @@ mod tests {
         assert_eq!(
             key_event_to_bytes(&KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
             Some(b"\x1b".to_vec()),
+        );
+    }
+
+    #[test]
+    fn tmux_mouse_event_to_bytes_encodes_pane_relative_coordinates() {
+        let pane = Rect::new(24, 1, 50, 10);
+
+        assert_eq!(
+            tmux_mouse_event_to_bytes(
+                &MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 25,
+                    row: 3,
+                    modifiers: KeyModifiers::empty(),
+                },
+                pane,
+            ),
+            Some(b"\x1b[<0;2;3M".to_vec()),
+        );
+        assert_eq!(
+            tmux_mouse_event_to_bytes(
+                &MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    column: 25,
+                    row: 3,
+                    modifiers: KeyModifiers::empty(),
+                },
+                pane,
+            ),
+            Some(b"\x1b[<3;2;3m".to_vec()),
+        );
+        assert_eq!(
+            tmux_mouse_event_to_bytes(
+                &MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: 30,
+                    row: 4,
+                    modifiers: KeyModifiers::SHIFT,
+                },
+                pane,
+            ),
+            Some(b"\x1b[<68;7;4M".to_vec()),
         );
     }
 }
