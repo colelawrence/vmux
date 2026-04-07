@@ -1,9 +1,11 @@
+use crate::notify;
 use crate::state::AppState;
 use crate::tmux::{TmuxAdapter, TmuxSession};
 use crate::VmuxError;
 use crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, terminal};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -11,11 +13,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 use std::io::{stdout, Read, Write};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use vt100::{Color as VtColor, Parser};
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 struct TerminalCleanup {
     raw_enabled: bool,
@@ -91,7 +93,11 @@ struct TmuxPane {
 }
 
 impl TmuxPane {
-    fn spawn(adapter: &mut dyn TmuxAdapter, session_name: &str, size: Rect) -> Result<Self, VmuxError> {
+    fn spawn(
+        adapter: &mut dyn TmuxAdapter,
+        session_name: &str,
+        size: Rect,
+    ) -> Result<Self, VmuxError> {
         let cmd = adapter
             .build_client_command(session_name)
             .map_err(VmuxError::Tmux)?;
@@ -231,6 +237,13 @@ fn session_label_line(session: &TmuxSession, recent_bell_count: usize) -> Line<'
     Line::from(spans)
 }
 
+fn refresh_recent_activity(state: &mut AppState, now: SystemTime) -> Result<(), VmuxError> {
+    let path = recent_activity_ledger_path();
+    let windows = notify::load_recent_activity_windows(&path, now).map_err(VmuxError::Notify)?;
+    state.observe_bell_windows_at(windows, now);
+    Ok(())
+}
+
 fn split_area(area: Rect) -> [Rect; 2] {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -245,6 +258,19 @@ fn split_sidebar(area: Rect) -> [Rect; 2] {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
     [chunks[0], chunks[1]]
+}
+
+fn default_recent_activity_ledger_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cache/vmux/session-updates.jsonl")
+}
+
+fn recent_activity_ledger_path() -> PathBuf {
+    std::env::var_os("VMUX_NOTIFY_LEDGER_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_recent_activity_ledger_path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,7 +341,12 @@ fn tmux_mouse_event_to_bytes(event: &MouseEvent, pane: Rect) -> Option<Vec<u8>> 
     let x = event.column.saturating_sub(pane.x).saturating_add(1);
     let y = event.row.saturating_sub(pane.y).saturating_add(1);
     let suffix = match event.kind {
-        MouseEventKind::Down(_) | MouseEventKind::Drag(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => 'M',
+        MouseEventKind::Down(_)
+        | MouseEventKind::Drag(_)
+        | MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => 'M',
         MouseEventKind::Up(_) => 'm',
         MouseEventKind::Moved => return None,
     };
@@ -400,11 +431,12 @@ fn screen_to_lines(screen: &vt100::Screen, width: u16, height: u16) -> Vec<Line<
         let mut current_style: Option<Style> = None;
         let mut current_text = String::with_capacity(width as usize);
 
-        let push_run = |spans: &mut Vec<Span<'static>>, style: &mut Option<Style>, text: &mut String| {
-            if let Some(style) = style.take() {
-                spans.push(Span::styled(std::mem::take(text), style));
-            }
-        };
+        let push_run =
+            |spans: &mut Vec<Span<'static>>, style: &mut Option<Style>, text: &mut String| {
+                if let Some(style) = style.take() {
+                    spans.push(Span::styled(std::mem::take(text), style));
+                }
+            };
 
         for col in 0..width {
             let Some(cell) = screen.cell(row, col) else {
@@ -485,7 +517,9 @@ fn key_modifier_value(modifiers: crossterm::event::KeyModifiers) -> Option<u8> {
 fn has_escape_prefix(modifiers: crossterm::event::KeyModifiers) -> bool {
     use crossterm::event::KeyModifiers;
 
-    modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SUPER | KeyModifiers::HYPER)
+    modifiers.intersects(
+        KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SUPER | KeyModifiers::HYPER,
+    )
 }
 
 fn modified_csi_sequence(
@@ -493,90 +527,104 @@ fn modified_csi_sequence(
     final_char: char,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Option<Vec<u8>> {
-    key_modifier_value(modifiers).map(|modifier| {
-        format!("\x1b[{parameter};{modifier}{final_char}").into_bytes()
-    })
+    key_modifier_value(modifiers)
+        .map(|modifier| format!("\x1b[{parameter};{modifier}{final_char}").into_bytes())
 }
 
 fn key_event_to_bytes(key: &crossterm::event::KeyEvent) -> Option<Vec<u8>> {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    let bytes = match key.code {
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let mut bytes = vec![control_code(c)?];
-            if has_escape_prefix(key.modifiers) {
-                bytes.insert(0, 0x1b);
-            }
-            bytes
-        }
-        KeyCode::Char(c) => {
-            let mut bytes = c.to_string().into_bytes();
-            if has_escape_prefix(key.modifiers) {
-                bytes.insert(0, 0x1b);
-            }
-            bytes
-        }
-        KeyCode::Enter => b"\r".to_vec(),
-        KeyCode::Tab => b"\t".to_vec(),
-        KeyCode::BackTab => {
-            if let Some(modifier) = key_modifier_value(key.modifiers) {
-                if modifier == 2 {
-                    b"\x1b[Z".to_vec()
-                } else {
-                    format!("\x1b[1;{modifier}Z").into_bytes()
+    let bytes =
+        match key.code {
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let mut bytes = vec![control_code(c)?];
+                if has_escape_prefix(key.modifiers) {
+                    bytes.insert(0, 0x1b);
                 }
-            } else {
-                b"\x1b[Z".to_vec()
+                bytes
             }
-        }
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Insert => modified_csi_sequence(2, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[2~".to_vec()),
-        KeyCode::Delete => modified_csi_sequence(3, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[3~".to_vec()),
-        KeyCode::Home => modified_csi_sequence(1, 'H', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[H".to_vec()),
-        KeyCode::End => modified_csi_sequence(1, 'F', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[F".to_vec()),
-        KeyCode::PageUp => modified_csi_sequence(5, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[5~".to_vec()),
-        KeyCode::PageDown => modified_csi_sequence(6, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[6~".to_vec()),
-        KeyCode::Left => modified_csi_sequence(1, 'D', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[D".to_vec()),
-        KeyCode::Right => modified_csi_sequence(1, 'C', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[C".to_vec()),
-        KeyCode::Up => modified_csi_sequence(1, 'A', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[A".to_vec()),
-        KeyCode::Down => modified_csi_sequence(1, 'B', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[B".to_vec()),
-        KeyCode::F(1) => modified_csi_sequence(1, 'P', key.modifiers)
-            .unwrap_or_else(|| b"\x1bOP".to_vec()),
-        KeyCode::F(2) => modified_csi_sequence(1, 'Q', key.modifiers)
-            .unwrap_or_else(|| b"\x1bOQ".to_vec()),
-        KeyCode::F(3) => modified_csi_sequence(1, 'R', key.modifiers)
-            .unwrap_or_else(|| b"\x1bOR".to_vec()),
-        KeyCode::F(4) => modified_csi_sequence(1, 'S', key.modifiers)
-            .unwrap_or_else(|| b"\x1bOS".to_vec()),
-        KeyCode::F(5) => modified_csi_sequence(15, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[15~".to_vec()),
-        KeyCode::F(6) => modified_csi_sequence(17, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[17~".to_vec()),
-        KeyCode::F(7) => modified_csi_sequence(18, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[18~".to_vec()),
-        KeyCode::F(8) => modified_csi_sequence(19, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[19~".to_vec()),
-        KeyCode::F(9) => modified_csi_sequence(20, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[20~".to_vec()),
-        KeyCode::F(10) => modified_csi_sequence(21, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[21~".to_vec()),
-        KeyCode::F(11) => modified_csi_sequence(23, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[23~".to_vec()),
-        KeyCode::F(12) => modified_csi_sequence(24, '~', key.modifiers)
-            .unwrap_or_else(|| b"\x1b[24~".to_vec()),
-        KeyCode::Esc => b"\x1b".to_vec(),
-        _ => return None,
-    };
+            KeyCode::Char(c) => {
+                let mut bytes = c.to_string().into_bytes();
+                if has_escape_prefix(key.modifiers) {
+                    bytes.insert(0, 0x1b);
+                }
+                bytes
+            }
+            KeyCode::Enter => b"\r".to_vec(),
+            KeyCode::Tab => b"\t".to_vec(),
+            KeyCode::BackTab => {
+                if let Some(modifier) = key_modifier_value(key.modifiers) {
+                    if modifier == 2 {
+                        b"\x1b[Z".to_vec()
+                    } else {
+                        format!("\x1b[1;{modifier}Z").into_bytes()
+                    }
+                } else {
+                    b"\x1b[Z".to_vec()
+                }
+            }
+            KeyCode::Backspace => vec![0x7f],
+            KeyCode::Insert => {
+                modified_csi_sequence(2, '~', key.modifiers).unwrap_or_else(|| b"\x1b[2~".to_vec())
+            }
+            KeyCode::Delete => {
+                modified_csi_sequence(3, '~', key.modifiers).unwrap_or_else(|| b"\x1b[3~".to_vec())
+            }
+            KeyCode::Home => {
+                modified_csi_sequence(1, 'H', key.modifiers).unwrap_or_else(|| b"\x1b[H".to_vec())
+            }
+            KeyCode::End => {
+                modified_csi_sequence(1, 'F', key.modifiers).unwrap_or_else(|| b"\x1b[F".to_vec())
+            }
+            KeyCode::PageUp => {
+                modified_csi_sequence(5, '~', key.modifiers).unwrap_or_else(|| b"\x1b[5~".to_vec())
+            }
+            KeyCode::PageDown => {
+                modified_csi_sequence(6, '~', key.modifiers).unwrap_or_else(|| b"\x1b[6~".to_vec())
+            }
+            KeyCode::Left => {
+                modified_csi_sequence(1, 'D', key.modifiers).unwrap_or_else(|| b"\x1b[D".to_vec())
+            }
+            KeyCode::Right => {
+                modified_csi_sequence(1, 'C', key.modifiers).unwrap_or_else(|| b"\x1b[C".to_vec())
+            }
+            KeyCode::Up => {
+                modified_csi_sequence(1, 'A', key.modifiers).unwrap_or_else(|| b"\x1b[A".to_vec())
+            }
+            KeyCode::Down => {
+                modified_csi_sequence(1, 'B', key.modifiers).unwrap_or_else(|| b"\x1b[B".to_vec())
+            }
+            KeyCode::F(1) => {
+                modified_csi_sequence(1, 'P', key.modifiers).unwrap_or_else(|| b"\x1bOP".to_vec())
+            }
+            KeyCode::F(2) => {
+                modified_csi_sequence(1, 'Q', key.modifiers).unwrap_or_else(|| b"\x1bOQ".to_vec())
+            }
+            KeyCode::F(3) => {
+                modified_csi_sequence(1, 'R', key.modifiers).unwrap_or_else(|| b"\x1bOR".to_vec())
+            }
+            KeyCode::F(4) => {
+                modified_csi_sequence(1, 'S', key.modifiers).unwrap_or_else(|| b"\x1bOS".to_vec())
+            }
+            KeyCode::F(5) => modified_csi_sequence(15, '~', key.modifiers)
+                .unwrap_or_else(|| b"\x1b[15~".to_vec()),
+            KeyCode::F(6) => modified_csi_sequence(17, '~', key.modifiers)
+                .unwrap_or_else(|| b"\x1b[17~".to_vec()),
+            KeyCode::F(7) => modified_csi_sequence(18, '~', key.modifiers)
+                .unwrap_or_else(|| b"\x1b[18~".to_vec()),
+            KeyCode::F(8) => modified_csi_sequence(19, '~', key.modifiers)
+                .unwrap_or_else(|| b"\x1b[19~".to_vec()),
+            KeyCode::F(9) => modified_csi_sequence(20, '~', key.modifiers)
+                .unwrap_or_else(|| b"\x1b[20~".to_vec()),
+            KeyCode::F(10) => modified_csi_sequence(21, '~', key.modifiers)
+                .unwrap_or_else(|| b"\x1b[21~".to_vec()),
+            KeyCode::F(11) => modified_csi_sequence(23, '~', key.modifiers)
+                .unwrap_or_else(|| b"\x1b[23~".to_vec()),
+            KeyCode::F(12) => modified_csi_sequence(24, '~', key.modifiers)
+                .unwrap_or_else(|| b"\x1b[24~".to_vec()),
+            KeyCode::Esc => b"\x1b".to_vec(),
+            _ => return None,
+        };
 
     Some(bytes)
 }
@@ -591,10 +639,9 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
     let mut guard = TerminalGuard::init()?;
     let mut state = AppState::new(sessions.clone());
     let mut list_state = ListState::default();
-    state.observe_bell_windows(
-        adapter.list_bell_windows()?,
-        SystemTime::now(),
-    );
+    let initial_poll = SystemTime::now();
+    state.observe_bell_windows(adapter.list_bell_windows()?, initial_poll);
+    refresh_recent_activity(&mut state, initial_poll)?;
     let mut last_bell_poll = Instant::now();
 
     // Initial tmux pane for the selected session.
@@ -603,7 +650,9 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
 
     loop {
         if last_bell_poll.elapsed() >= RECENT_BELL_POLL_INTERVAL {
-            state.observe_bell_windows(adapter.list_bell_windows()?, SystemTime::now());
+            let poll_at = SystemTime::now();
+            state.observe_bell_windows(adapter.list_bell_windows()?, poll_at);
+            refresh_recent_activity(&mut state, poll_at)?;
             last_bell_poll = Instant::now();
         }
 
@@ -670,7 +719,8 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
 
                     // Render the tmux screen into the left-hand pane.
                     // TODO: if this becomes a hot path, avoid rebuilding the entire pane every frame.
-                    let lines = screen_to_lines(pane.parser.screen(), chunks[0].width, chunks[0].height);
+                    let lines =
+                        screen_to_lines(pane.parser.screen(), chunks[0].width, chunks[0].height);
                     let paragraph = Paragraph::new(lines);
                     frame.render_widget(paragraph, chunks[0]);
                 } else {
@@ -688,14 +738,11 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
         }
 
         // Test-only escape hatch: let smoke tests stop after the first successful draw.
-        if cfg!(debug_assertions)
-            && std::env::var("VMUX_TEST_ONESHOT").as_deref() == Ok("1")
-        {
+        if cfg!(debug_assertions) && std::env::var("VMUX_TEST_ONESHOT").as_deref() == Ok("1") {
             break;
         }
 
-        if event::poll(Duration::from_millis(50)).map_err(|e| VmuxError::Terminal(e.to_string()))?
-        {
+        if event::poll(Duration::from_millis(50)).map_err(|e| VmuxError::Terminal(e.to_string()))? {
             match event::read().map_err(|e| VmuxError::Terminal(e.to_string()))? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Some(ref mut pane) = tmux_pane {
@@ -729,7 +776,9 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
                         {
                             break;
                         }
-                        _ if rect_contains(chunks[0], mouse.column, mouse.row) || tmux_mouse_captured => {
+                        _ if rect_contains(chunks[0], mouse.column, mouse.row)
+                            || tmux_mouse_captured =>
+                        {
                             if let Some(ref mut pane) = tmux_pane {
                                 if let Some(bytes) = tmux_mouse_event_to_bytes(&mouse, chunks[0]) {
                                     pane.send_input(&bytes)?;
@@ -771,7 +820,9 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
 
     #[test]
     fn screen_to_lines_preserves_ansi_colors() {

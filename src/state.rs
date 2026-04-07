@@ -37,9 +37,23 @@ impl AppState {
     }
 
     pub fn observe_bell_windows(&mut self, windows: Vec<TmuxBellWindow>, observed_at: SystemTime) {
-        self.prune_recent_bells(observed_at);
+        self.observe_bell_windows_at(
+            windows
+                .into_iter()
+                .map(|window| (window, observed_at))
+                .collect(),
+            observed_at,
+        )
+    }
 
-        for window in windows {
+    pub fn observe_bell_windows_at(
+        &mut self,
+        windows: Vec<(TmuxBellWindow, SystemTime)>,
+        prune_at: SystemTime,
+    ) {
+        self.prune_recent_bells(prune_at);
+
+        for (window, observed_at) in windows {
             let key = Self::bell_key(&window.session_name, &window.window_id);
             self.recent_bells.insert(
                 key,
@@ -63,10 +77,12 @@ impl AppState {
     }
 
     fn prune_recent_bells(&mut self, observed_at: SystemTime) {
-        self.recent_bells.retain(|_, bell| match observed_at.duration_since(bell.observed_at) {
-            Ok(age) => age <= RECENT_BELL_TTL,
-            Err(_) => true,
-        });
+        self.recent_bells.retain(
+            |_, bell| match observed_at.duration_since(bell.observed_at) {
+                Ok(age) => age <= RECENT_BELL_TTL,
+                Err(_) => true,
+            },
+        );
     }
 
     pub fn move_up(&mut self) {

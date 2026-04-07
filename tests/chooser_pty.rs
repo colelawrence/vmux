@@ -76,8 +76,20 @@ fn split_view_renders_sidebar_and_embedded_tmux() {
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     let log = fs::read_to_string(&log_path).expect("read tmux invocation log");
-    assert!(log.contains("list-sessions"), "vmux should list tmux sessions");
-    assert!(log.contains("list-windows"), "vmux should poll tmux bell state");
-    assert!(log.contains("attach-session"), "vmux should attach the selected session");
-    assert!(log.contains("KEY:71"), "q should be forwarded to tmux, not intercepted by vmux");
+    assert!(
+        log.contains("list-sessions"),
+        "vmux should list tmux sessions"
+    );
+    assert!(
+        log.contains("list-windows"),
+        "vmux should poll tmux bell state"
+    );
+    assert!(
+        log.contains("attach-session"),
+        "vmux should attach the selected session"
+    );
+    assert!(
+        log.contains("KEY:71"),
+        "q should be forwarded to tmux, not intercepted by vmux"
+    );
 }

@@ -42,7 +42,10 @@ impl TmuxAdapter for FakeTmux {
         Ok(self.bell_windows.clone())
     }
 
-    fn build_client_command(&mut self, session_name: &str) -> Result<std::process::Command, vmux::tmux::TmuxError> {
+    fn build_client_command(
+        &mut self,
+        session_name: &str,
+    ) -> Result<std::process::Command, vmux::tmux::TmuxError> {
         self.last_client.borrow_mut().push(session_name.to_string());
         Ok(Command::new("tmux-client-placeholder"))
     }
@@ -103,7 +106,14 @@ fn real_tmux_list_sessions_on_isolated_server() {
 
     // Start an isolated tmux server with a single session.
     let status = Command::new("tmux")
-        .args(["-L", socket.as_str(), "new-session", "-d", "-s", "vmux_test"])
+        .args([
+            "-L",
+            socket.as_str(),
+            "new-session",
+            "-d",
+            "-s",
+            "vmux_test",
+        ])
         .status()
         .expect("failed to start tmux test server");
     if !status.success() {
