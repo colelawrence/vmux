@@ -1,10 +1,7 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
-use tempfile::TempDir;
 
 fn vmux_bin() -> String {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_vmux") {
@@ -13,15 +10,6 @@ fn vmux_bin() -> String {
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     format!("{manifest_dir}/target/debug/vmux")
-}
-
-fn make_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
-    let path = dir.path().join(name);
-    fs::write(&path, body).expect("write script");
-    let mut perms = fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).expect("chmod script");
-    path
 }
 
 struct TmuxServerGuard {
@@ -37,7 +25,7 @@ impl Drop for TmuxServerGuard {
 }
 
 #[test]
-fn notify_mode_appends_ledger_and_forwards_to_secondary_script() {
+fn notify_mode_appends_ledger_with_tmux_context() {
     if Command::new("tmux").arg("-V").output().is_err() {
         eprintln!("skipping vmux notify test: tmux not available");
         return;
@@ -129,15 +117,6 @@ fn notify_mode_appends_ledger_and_forwards_to_secondary_script() {
     .expect("write payload");
 
     let ledger_path = dir.path().join("ledger.jsonl");
-    let secondary_log = dir.path().join("secondary.log");
-    let secondary_script = make_script(
-        &dir,
-        "secondary.sh",
-        &format!(
-            "#!/usr/bin/env bash\nset -eu\necho \"$1\" >> '{}'\n",
-            secondary_log.display()
-        ),
-    );
 
     let mut cmd = Command::new(vmux_bin());
     cmd.arg("notify").arg(&payload_path);
@@ -145,7 +124,6 @@ fn notify_mode_appends_ledger_and_forwards_to_secondary_script() {
     cmd.env("TMUX", format!("{socket},1,0"));
     cmd.env("TMUX_PANE", pane_id.as_str());
     cmd.env("VMUX_NOTIFY_LEDGER_PATH", &ledger_path);
-    cmd.env("VMUX_NOTIFY_SECONDARY_SCRIPT", &secondary_script);
 
     let output = cmd.output().expect("run vmux notify");
     if !output.status.success() {
@@ -166,7 +144,4 @@ fn notify_mode_appends_ledger_and_forwards_to_secondary_script() {
     assert_eq!(record["session"]["sessionName"], "vmux_notify_test");
     assert_eq!(record["session"]["windowId"], "@0");
     assert_eq!(record["session"]["sessionId"], expected_session_id);
-
-    let secondary = fs::read_to_string(&secondary_log).expect("read secondary log");
-    assert!(secondary.contains(payload_path.to_string_lossy().as_ref()));
 }

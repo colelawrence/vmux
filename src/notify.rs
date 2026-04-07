@@ -10,7 +10,6 @@ use std::time::{Duration, SystemTime};
 
 const RECENT_ACTIVITY_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LEDGER_RELATIVE_PATH: &str = ".cache/vmux/session-updates.jsonl";
-const DEFAULT_SECONDARY_SCRIPT: &str = ".pi/agent/scripts/telegram-notify.sh";
 
 #[derive(Debug)]
 pub enum NotifyError {
@@ -122,23 +121,6 @@ fn ledger_path_from_env() -> PathBuf {
     env::var_os("VMUX_NOTIFY_LEDGER_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(default_ledger_path)
-}
-
-fn secondary_script_path_from_env() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("VMUX_NOTIFY_SECONDARY_SCRIPT") {
-        let path = PathBuf::from(path);
-        if !path.as_os_str().is_empty() {
-            return Some(path);
-        }
-        return None;
-    }
-
-    if env::var_os("TELEGRAM_CHAT_ID").is_some() {
-        let default = home_dir().join(DEFAULT_SECONDARY_SCRIPT);
-        return default.exists().then_some(default);
-    }
-
-    None
 }
 
 enum TmuxSocketSpec {
@@ -279,27 +261,6 @@ fn append_ledger_record(path: &Path, record: &NotificationLedgerRecord) -> Resul
     Ok(())
 }
 
-fn maybe_forward_secondary(payload_path: &Path) {
-    let Some(script) = secondary_script_path_from_env() else {
-        return;
-    };
-
-    if !script.exists() {
-        return;
-    }
-
-    let status = Command::new(script).arg(payload_path).status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("vmux notify: secondary script exited with status {status}");
-        }
-        Err(err) => {
-            eprintln!("vmux notify: failed to run secondary script: {err}");
-        }
-    }
-}
-
 pub fn run_notify(payload_path: &Path) -> Result<(), NotifyError> {
     if payload_path.as_os_str().is_empty() {
         return Err(NotifyError::Usage("payload path is required".to_string()));
@@ -312,13 +273,19 @@ pub fn run_notify(payload_path: &Path) -> Result<(), NotifyError> {
         ))
     })?;
     let payload: NotificationPayloadV1 = serde_json::from_str(&payload_text)?;
+
     let live_tmux = capture_live_tmux_context();
+    if payload.tmux.is_none() && live_tmux.is_none() {
+        return Err(NotifyError::Usage(
+            "notify requires tmux context in payload or tmux environment".to_string(),
+        ));
+    }
+
     let session = merge_tmux_context(payload.tmux.clone(), live_tmux);
     let record = ledger_record_from_payload(payload, session);
 
     let ledger_path = ledger_path_from_env();
     append_ledger_record(&ledger_path, &record)?;
-    maybe_forward_secondary(payload_path);
     Ok(())
 }
 
