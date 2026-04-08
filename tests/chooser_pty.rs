@@ -50,7 +50,7 @@ fn split_view_renders_sidebar_and_embedded_tmux() {
 
     let log_path = dir.path().join("tmux_invocations.log");
     let script = format!(
-        "#!/bin/sh\nset -eu\n\nLOG=\"{}\"\n\necho \"tmux invoked: $0 $@\" >> \"$LOG\"\ncase \"$1\" in\n  list-sessions)\n    echo 's1:1:0'\n    echo 's2:1:0'\n    ;;\n  list-windows)\n    echo 's1:@0:1'\n    ;;\n  attach-session)\n    printf '\\033[38;5;196mTMUX_SESSION:s1\\033[0m\\n'\n    # This fake client is intentionally short-lived: it reads one byte so the test can\n    # verify passthrough, then exits to exercise the embedded-client shutdown path.\n    stty raw -echo\n    key=\"$(dd bs=1 count=1 2>/dev/null | od -An -t x1 | tr -d ' \\n')\"\n    printf 'KEY:%s\\n' \"$key\" >> \"$LOG\"\n    ;;\n  *)\n    echo \"unexpected tmux command: $0 $@\" >> \"$LOG\"\n    ;;\n esac\n",
+        "#!/bin/sh\nset -eu\n\nLOG=\"{}\"\n\necho \"tmux invoked: $0 $@\" >> \"$LOG\"\ncase \"$1\" in\n  list-sessions)\n    echo 's1:1:0'\n    echo 's2:1:0'\n    ;;\n  attach-session)\n    printf '\\033[38;5;196mTMUX_SESSION:s1\\033[0m\\n'\n    # This fake client is intentionally short-lived: it reads one byte so the test can\n    # verify passthrough, then exits to exercise the embedded-client shutdown path.\n    stty raw -echo\n    key=\"$(dd bs=1 count=1 2>/dev/null | od -An -t x1 | tr -d ' \\n')\"\n    printf 'KEY:%s\\n' \"$key\" >> \"$LOG\"\n    ;;\n  *)\n    echo \"unexpected tmux command: $0 $@\" >> \"$LOG\"\n    ;;\n esac\n",
         log_path.display()
     );
 
@@ -81,15 +81,47 @@ fn split_view_renders_sidebar_and_embedded_tmux() {
         "vmux should list tmux sessions"
     );
     assert!(
-        log.contains("list-windows"),
-        "vmux should poll tmux bell state"
-    );
-    assert!(
         log.contains("attach-session"),
         "vmux should attach the selected session"
     );
     assert!(
         log.contains("KEY:71"),
         "q should be forwarded to tmux, not intercepted by vmux"
+    );
+}
+
+#[test]
+fn split_view_passes_raw_keyboard_bytes_to_embedded_tmux() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let log_path = dir.path().join("tmux_raw_bytes.log");
+    let script = format!(
+        "#!/bin/sh\nset -eu\n\nLOG=\"{}\"\n\necho \"tmux invoked: $0 $@\" >> \"$LOG\"\ncase \"$1\" in\n  list-sessions)\n    echo 's1:1:0'\n    ;;\n  attach-session)\n    printf 'READY\\n'\n    stty raw -echo\n    keys=\"$(dd bs=1 count=2 2>/dev/null | od -An -t x1 | tr -d ' \\n')\"\n    printf 'KEYS:%s\\n' \"$keys\" >> \"$LOG\"\n    ;;\n  *)\n    echo \"unexpected tmux command: $0 $@\" >> \"$LOG\"\n    ;;\n esac\n",
+        log_path.display()
+    );
+
+    make_fake_tmux_script(&dir, &script);
+
+    let bin = vmux_bin();
+    let mut cmd = Command::new(&bin);
+
+    for (k, v) in with_fake_tmux_env(&dir) {
+        cmd.env(k, v);
+    }
+
+    cmd.env_remove("TMUX");
+
+    let mut pty = spawn_in_pty(cmd).expect("spawn vmux in pty");
+    pty.expect(Regex("READY"))
+        .expect("embedded tmux pane should be ready");
+
+    pty.send("\u{1b}\r")
+        .expect("send raw alt-enter byte sequence to tmux");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let log = fs::read_to_string(&log_path).expect("read tmux invocation log");
+    assert!(
+        log.contains("KEYS:1b0d"),
+        "vmux should forward raw keyboard bytes unchanged to tmux"
     );
 }

@@ -1,20 +1,29 @@
-use crate::tmux::{TmuxBellWindow, TmuxSession};
+use crate::notify::RECENT_ACTIVITY_TTL;
+use crate::tmux::TmuxSession;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
-const RECENT_BELL_TTL: Duration = Duration::from_secs(120);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentPane {
+    pub session_name: String,
+    pub window_id: String,
+    pub pane_id: String,
+    pub title: String,
+    pub observed_at: SystemTime,
+}
 
-#[derive(Debug, Clone)]
-struct RecentBell {
-    session_name: String,
-    observed_at: SystemTime,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedPaneTarget {
+    pub window_id: String,
+    pub pane_id: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub sessions: Vec<TmuxSession>,
     pub selected: usize,
-    recent_bells: HashMap<String, RecentBell>,
+    selected_pane: Option<SelectedPaneTarget>,
+    recent_panes: HashMap<String, RecentPane>,
 }
 
 impl AppState {
@@ -28,7 +37,8 @@ impl AppState {
         Self {
             sessions,
             selected,
-            recent_bells: HashMap::new(),
+            selected_pane: None,
+            recent_panes: HashMap::new(),
         }
     }
 
@@ -36,50 +46,75 @@ impl AppState {
         self.sessions.is_empty()
     }
 
-    pub fn observe_bell_windows(&mut self, windows: Vec<TmuxBellWindow>, observed_at: SystemTime) {
-        self.observe_bell_windows_at(
-            windows
-                .into_iter()
-                .map(|window| (window, observed_at))
-                .collect(),
-            observed_at,
-        )
-    }
+    pub fn observe_recent_panes(&mut self, panes: Vec<RecentPane>, prune_at: SystemTime) {
+        self.prune_recent_panes(prune_at);
 
-    pub fn observe_bell_windows_at(
-        &mut self,
-        windows: Vec<(TmuxBellWindow, SystemTime)>,
-        prune_at: SystemTime,
-    ) {
-        self.prune_recent_bells(prune_at);
+        for pane in panes {
+            let key = Self::recent_pane_key(&pane.session_name, &pane.pane_id);
+            self.recent_panes.insert(key, pane);
+        }
 
-        for (window, observed_at) in windows {
-            let key = Self::bell_key(&window.session_name, &window.window_id);
-            self.recent_bells.insert(
-                key,
-                RecentBell {
-                    session_name: window.session_name,
-                    observed_at,
-                },
-            );
+        if let Some(selected_pane) = self.selected_pane.as_ref() {
+            let session_name = self
+                .sessions
+                .get(self.selected)
+                .map(|session| session.name.as_str())
+                .unwrap_or_default();
+            let key = Self::recent_pane_key(session_name, &selected_pane.pane_id);
+            if !self.recent_panes.contains_key(&key) {
+                self.selected_pane = None;
+            }
         }
     }
 
-    pub fn recent_bell_count(&self, session_name: &str) -> usize {
-        self.recent_bells
+    pub fn recent_panes_for_session(&self, session_name: &str) -> Vec<RecentPane> {
+        let mut panes: Vec<RecentPane> = self
+            .recent_panes
             .values()
-            .filter(|bell| bell.session_name == session_name)
-            .count()
+            .filter(|pane| pane.session_name == session_name)
+            .cloned()
+            .collect();
+
+        panes.sort_by(|a, b| {
+            b.observed_at
+                .cmp(&a.observed_at)
+                .then_with(|| a.title.cmp(&b.title))
+                .then_with(|| a.pane_id.cmp(&b.pane_id))
+        });
+        panes
     }
 
-    fn bell_key(session_name: &str, window_id: &str) -> String {
-        format!("{session_name}:{window_id}")
+    pub fn selected_pane_target(&self) -> Option<&SelectedPaneTarget> {
+        self.selected_pane.as_ref()
     }
 
-    fn prune_recent_bells(&mut self, observed_at: SystemTime) {
-        self.recent_bells.retain(
-            |_, bell| match observed_at.duration_since(bell.observed_at) {
-                Ok(age) => age <= RECENT_BELL_TTL,
+    pub fn select_session(&mut self, index: usize) {
+        if index >= self.sessions.len() {
+            return;
+        }
+        self.selected = index;
+        self.selected_pane = None;
+    }
+
+    pub fn select_pane(&mut self, session_index: usize, pane: &RecentPane) {
+        if session_index >= self.sessions.len() {
+            return;
+        }
+        self.selected = session_index;
+        self.selected_pane = Some(SelectedPaneTarget {
+            window_id: pane.window_id.clone(),
+            pane_id: pane.pane_id.clone(),
+        });
+    }
+
+    fn recent_pane_key(session_name: &str, pane_id: &str) -> String {
+        format!("{session_name}:{pane_id}")
+    }
+
+    fn prune_recent_panes(&mut self, observed_at: SystemTime) {
+        self.recent_panes.retain(
+            |_, pane| match observed_at.duration_since(pane.observed_at) {
+                Ok(age) => age <= RECENT_ACTIVITY_TTL,
                 Err(_) => true,
             },
         );
@@ -94,6 +129,7 @@ impl AppState {
         } else {
             self.selected -= 1;
         }
+        self.selected_pane = None;
     }
 
     pub fn move_down(&mut self) {
@@ -101,5 +137,6 @@ impl AppState {
             return;
         }
         self.selected = (self.selected + 1) % self.sessions.len();
+        self.selected_pane = None;
     }
 }

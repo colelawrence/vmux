@@ -96,6 +96,8 @@ fn notify_mode_appends_ledger_with_tmux_context() {
   "title":"Demo",
   "subtitle":"Pi Coding Agent",
   "body":"Working",
+  "outcome":"success",
+  "importance":"normal",
   "latestAssistantMessage":"Hello there",
   "platform":"darwin",
   "timestamp":1234567890,
@@ -141,6 +143,8 @@ fn notify_mode_appends_ledger_with_tmux_context() {
         .expect("ledger line");
     let record: Value = serde_json::from_str(line).expect("parse ledger record");
     assert_eq!(record["kind"], "system-notification");
+    assert_eq!(record["outcome"], "success");
+    assert_eq!(record["importance"], "normal");
     assert_eq!(record["session"]["sessionName"], "vmux_notify_test");
     assert_eq!(record["session"]["windowId"], "@0");
     assert_eq!(record["session"]["sessionId"], expected_session_id);

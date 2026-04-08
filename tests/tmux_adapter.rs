@@ -45,6 +45,8 @@ impl TmuxAdapter for FakeTmux {
     fn build_client_command(
         &mut self,
         session_name: &str,
+        _window_id: Option<&str>,
+        _pane_id: Option<&str>,
     ) -> Result<std::process::Command, vmux::tmux::TmuxError> {
         self.last_client.borrow_mut().push(session_name.to_string());
         Ok(Command::new("tmux-client-placeholder"))
@@ -57,8 +59,37 @@ fn fake_tmux_adapter_records_client_build() {
     let sessions = fake.list_sessions().unwrap();
     assert_eq!(sessions.len(), 2);
 
-    let _cmd = fake.build_client_command("two").unwrap();
+    let _cmd = fake.build_client_command("two", None, None).unwrap();
     assert_eq!(fake.last_client.borrow().as_slice(), &["two".to_string()]);
+}
+
+#[test]
+fn real_tmux_adapter_builds_exact_pane_target_command() {
+    let mut adapter = RealTmuxAdapter::from_env();
+    let cmd = adapter
+        .build_client_command("demo", Some("@7"), Some("%9"))
+        .expect("build client command");
+
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        vec![
+            "attach-session".to_string(),
+            "-t".to_string(),
+            "demo".to_string(),
+            ";".to_string(),
+            "select-window".to_string(),
+            "-t".to_string(),
+            "@7".to_string(),
+            ";".to_string(),
+            "select-pane".to_string(),
+            "-t".to_string(),
+            "%9".to_string(),
+        ]
+    );
 }
 
 #[test]

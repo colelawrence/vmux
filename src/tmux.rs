@@ -56,11 +56,14 @@ pub trait TmuxAdapter {
     /// List windows currently flagged as having a bell.
     fn list_bell_windows(&mut self) -> Result<Vec<TmuxBellWindow>, TmuxError>;
 
-    /// Build a tmux client command that attaches to the given session.
-    ///
-    /// The caller is responsible for running this command in a PTY so that
-    /// tmux can control a full-screen terminal inside the vmux host UI.
-    fn build_client_command(&mut self, session_name: &str) -> Result<Command, TmuxError>;
+    /// Build a tmux client command that attaches to the given session, optionally
+    /// selecting an exact window and pane inside it.
+    fn build_client_command(
+        &mut self,
+        session_name: &str,
+        window_id: Option<&str>,
+        pane_id: Option<&str>,
+    ) -> Result<Command, TmuxError>;
 }
 
 /// Real tmux adapter that shells out to the `tmux` binary.
@@ -167,11 +170,22 @@ impl TmuxAdapter for RealTmuxAdapter {
         Ok(windows)
     }
 
-    fn build_client_command(&mut self, session_name: &str) -> Result<Command, TmuxError> {
+    fn build_client_command(
+        &mut self,
+        session_name: &str,
+        window_id: Option<&str>,
+        pane_id: Option<&str>,
+    ) -> Result<Command, TmuxError> {
         let mut cmd = self.base_command();
         // For the split-view host we always run a nested tmux client inside
         // vmux's own PTY, so we consistently use `attach-session`.
         cmd.arg("attach-session").arg("-t").arg(session_name);
+        if let Some(window_id) = window_id {
+            cmd.arg(";").arg("select-window").arg("-t").arg(window_id);
+        }
+        if let Some(pane_id) = pane_id {
+            cmd.arg(";").arg("select-pane").arg("-t").arg(pane_id);
+        }
         Ok(cmd)
     }
 }

@@ -3,7 +3,7 @@ mod state;
 pub mod tmux;
 mod ui;
 
-pub use crate::state::AppState;
+pub use crate::state::{AppState, RecentPane, SelectedPaneTarget};
 pub use crate::tmux::{RealTmuxAdapter, TmuxAdapter, TmuxError, TmuxSession};
 
 /// Top-level vmux entry point used by `main`.
