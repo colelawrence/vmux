@@ -1,12 +1,10 @@
-use crate::notify::RECENT_ACTIVITY_TTL;
 use crate::tmux::TmuxSession;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentPane {
-    pub session_name: String,
-    pub window_id: String,
+    pub session_id: String,
     pub pane_id: String,
     pub title: String,
     pub observed_at: SystemTime,
@@ -14,7 +12,6 @@ pub struct RecentPane {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedPaneTarget {
-    pub window_id: String,
     pub pane_id: String,
 }
 
@@ -28,11 +25,8 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(mut sessions: Vec<TmuxSession>) -> Self {
-        // Sort sessions by name for a stable, deterministic order.
         sessions.sort_by(|a, b| a.name.cmp(&b.name));
-
-        // Prefer the attached session as the initial selection when present.
-        let selected = sessions.iter().position(|s| s.attached).unwrap_or(0);
+        let selected = sessions.iter().position(|session| session.attached).unwrap_or(0);
 
         Self {
             sessions,
@@ -46,32 +40,30 @@ impl AppState {
         self.sessions.is_empty()
     }
 
-    pub fn observe_recent_panes(&mut self, panes: Vec<RecentPane>, prune_at: SystemTime) {
-        self.prune_recent_panes(prune_at);
-
-        for pane in panes {
-            let key = Self::recent_pane_key(&pane.session_name, &pane.pane_id);
-            self.recent_panes.insert(key, pane);
-        }
+    pub fn observe_recent_panes(&mut self, panes: Vec<RecentPane>) {
+        self.recent_panes = panes
+            .into_iter()
+            .map(|pane| (Self::recent_pane_key(&pane.session_id, &pane.pane_id), pane))
+            .collect();
 
         if let Some(selected_pane) = self.selected_pane.as_ref() {
-            let session_name = self
+            let session_id = self
                 .sessions
                 .get(self.selected)
-                .map(|session| session.name.as_str())
+                .map(|session| session.id.as_str())
                 .unwrap_or_default();
-            let key = Self::recent_pane_key(session_name, &selected_pane.pane_id);
+            let key = Self::recent_pane_key(session_id, &selected_pane.pane_id);
             if !self.recent_panes.contains_key(&key) {
                 self.selected_pane = None;
             }
         }
     }
 
-    pub fn recent_panes_for_session(&self, session_name: &str) -> Vec<RecentPane> {
+    pub fn recent_panes_for_session(&self, session_id: &str) -> Vec<RecentPane> {
         let mut panes: Vec<RecentPane> = self
             .recent_panes
             .values()
-            .filter(|pane| pane.session_name == session_name)
+            .filter(|pane| pane.session_id == session_id)
             .cloned()
             .collect();
 
@@ -102,22 +94,12 @@ impl AppState {
         }
         self.selected = session_index;
         self.selected_pane = Some(SelectedPaneTarget {
-            window_id: pane.window_id.clone(),
             pane_id: pane.pane_id.clone(),
         });
     }
 
-    fn recent_pane_key(session_name: &str, pane_id: &str) -> String {
-        format!("{session_name}:{pane_id}")
-    }
-
-    fn prune_recent_panes(&mut self, observed_at: SystemTime) {
-        self.recent_panes.retain(
-            |_, pane| match observed_at.duration_since(pane.observed_at) {
-                Ok(age) => age <= RECENT_ACTIVITY_TTL,
-                Err(_) => true,
-            },
-        );
+    fn recent_pane_key(session_id: &str, pane_id: &str) -> String {
+        format!("{session_id}:{pane_id}")
     }
 
     pub fn move_up(&mut self) {

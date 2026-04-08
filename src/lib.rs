@@ -1,8 +1,9 @@
-mod notify;
+mod recent_activity;
 mod state;
 pub mod tmux;
 mod ui;
 
+pub use crate::recent_activity::RecentActivityError;
 pub use crate::state::{AppState, RecentPane, SelectedPaneTarget};
 pub use crate::tmux::{RealTmuxAdapter, TmuxAdapter, TmuxError, TmuxSession};
 
@@ -14,15 +15,21 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
     ui::run(adapter)
 }
 
+/// Append a `notify` event to the recent-activity event log.
 pub fn run_notify(payload_path: &std::path::Path) -> Result<(), VmuxError> {
-    notify::run_notify(payload_path).map_err(VmuxError::Notify)
+    recent_activity::run_notify(payload_path).map_err(VmuxError::RecentActivity)
+}
+
+/// Append a `clear` event to the recent-activity event log.
+pub fn run_clear(payload_path: &std::path::Path) -> Result<(), VmuxError> {
+    recent_activity::run_clear(payload_path).map_err(VmuxError::RecentActivity)
 }
 
 #[derive(Debug)]
 pub enum VmuxError {
     Usage(String),
     Tmux(TmuxError),
-    Notify(notify::NotifyError),
+    RecentActivity(recent_activity::RecentActivityError),
     Terminal(String),
 }
 
@@ -31,7 +38,7 @@ impl std::fmt::Display for VmuxError {
         match self {
             VmuxError::Usage(msg) => write!(f, "usage error: {msg}"),
             VmuxError::Tmux(e) => write!(f, "tmux error: {e}"),
-            VmuxError::Notify(e) => write!(f, "notify error: {e}"),
+            VmuxError::RecentActivity(e) => write!(f, "recent activity error: {e}"),
             VmuxError::Terminal(msg) => write!(f, "terminal error: {msg}"),
         }
     }

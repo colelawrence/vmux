@@ -1,4 +1,4 @@
-use crate::notify;
+use crate::recent_activity;
 use crate::state::{AppState, RecentPane, SelectedPaneTarget};
 use crate::tmux::{TmuxAdapter, TmuxSession};
 use crate::VmuxError;
@@ -138,16 +138,12 @@ struct TmuxPane {
 impl TmuxPane {
     fn spawn(
         adapter: &mut dyn TmuxAdapter,
-        session_name: &str,
+        session_id: &str,
         selected_pane: Option<&SelectedPaneTarget>,
         size: Rect,
     ) -> Result<Self, VmuxError> {
         let cmd = adapter
-            .build_client_command(
-                session_name,
-                selected_pane.map(|pane| pane.window_id.as_str()),
-                selected_pane.map(|pane| pane.pane_id.as_str()),
-            )
+            .build_client_command(session_id, selected_pane.map(|pane| pane.pane_id.as_str()))
             .map_err(VmuxError::Tmux)?;
 
         let pty_system = native_pty_system();
@@ -266,6 +262,7 @@ impl Drop for TmuxPane {
 }
 
 const RECENT_ACTIVITY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_RECENT_PANES_PER_SESSION: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidebarRow {
@@ -305,7 +302,11 @@ fn build_sidebar_rows(state: &AppState) -> Vec<SidebarRow> {
 
     for (session_index, session) in state.sessions.iter().enumerate() {
         rows.push(SidebarRow::Session { session_index });
-        for pane in state.recent_panes_for_session(&session.name) {
+        for pane in state
+            .recent_panes_for_session(&session.id)
+            .into_iter()
+            .take(MAX_RECENT_PANES_PER_SESSION)
+        {
             rows.push(SidebarRow::Pane {
                 session_index,
                 pane,
@@ -335,9 +336,7 @@ fn selected_sidebar_row_index(state: &AppState, rows: &[SidebarRow]) -> Option<u
             matches!(
                 row,
                 SidebarRow::Pane { session_index, pane }
-                    if *session_index == state.selected
-                        && pane.window_id == selected_pane.window_id
-                        && pane.pane_id == selected_pane.pane_id
+                    if *session_index == state.selected && pane.pane_id == selected_pane.pane_id
             )
         }) {
             return Some(row_index);
@@ -353,9 +352,10 @@ fn selected_sidebar_row_index(state: &AppState, rows: &[SidebarRow]) -> Option<u
 }
 
 fn refresh_recent_activity(state: &mut AppState, now: SystemTime) -> Result<(), VmuxError> {
-    let path = notify::ledger_path_from_env();
-    let panes = notify::load_recent_panes(&path, now).map_err(VmuxError::Notify)?;
-    state.observe_recent_panes(panes, now);
+    let path = recent_activity::event_log_path_from_env();
+    let panes = recent_activity::load_recent_panes(&path, now)
+        .map_err(VmuxError::RecentActivity)?;
+    state.observe_recent_panes(panes);
     Ok(())
 }
 
@@ -434,36 +434,42 @@ fn tmux_mouse_modifiers(modifiers: crossterm::event::KeyModifiers) -> u16 {
     code
 }
 
-fn tmux_mouse_event_to_bytes(event: &MouseEvent, pane: Rect) -> Option<Vec<u8>> {
-    if !rect_contains(pane, event.column, event.row) {
-        return None;
-    }
-
-    let x = event.column.saturating_sub(pane.x).saturating_add(1);
-    let y = event.row.saturating_sub(pane.y).saturating_add(1);
+fn tmux_mouse_event_to_bytes(event: &MouseEvent, pane: Rect) -> Vec<u8> {
+    let max_x = pane.width.saturating_sub(1);
+    let max_y = pane.height.saturating_sub(1);
+    let x = event
+        .column
+        .saturating_sub(pane.x)
+        .min(max_x)
+        .saturating_add(1);
+    let y = event
+        .row
+        .saturating_sub(pane.y)
+        .min(max_y)
+        .saturating_add(1);
     let suffix = match event.kind {
         MouseEventKind::Down(_)
         | MouseEventKind::Drag(_)
+        | MouseEventKind::Moved
         | MouseEventKind::ScrollUp
         | MouseEventKind::ScrollDown
         | MouseEventKind::ScrollLeft
         | MouseEventKind::ScrollRight => 'M',
         MouseEventKind::Up(_) => 'm',
-        MouseEventKind::Moved => return None,
     };
 
     let cb = match event.kind {
         MouseEventKind::Down(button) => tmux_mouse_button_code(button),
         MouseEventKind::Up(_) => 3,
         MouseEventKind::Drag(button) => 0b0010_0000 | tmux_mouse_button_code(button),
-        MouseEventKind::Moved => return None,
+        MouseEventKind::Moved => 0b0010_0000 | 0b11,
         MouseEventKind::ScrollUp => 0b0100_0000,
         MouseEventKind::ScrollDown => 0b0100_0001,
         MouseEventKind::ScrollLeft => 0b0100_0010,
         MouseEventKind::ScrollRight => 0b0100_0011,
     } | tmux_mouse_modifiers(event.modifiers);
 
-    Some(format!("\x1b[<{};{};{}{}", cb, x, y, suffix).into_bytes())
+    format!("\x1b[<{};{};{}{}", cb, x, y, suffix).into_bytes()
 }
 
 fn sync_sidebar_list_offset(
@@ -587,11 +593,24 @@ fn screen_to_lines(screen: &vt100::Screen, width: u16, height: u16) -> Vec<Line<
     lines
 }
 
+fn visible_cursor_position(screen: &vt100::Screen, pane: Rect) -> Option<(u16, u16)> {
+    if pane.width == 0 || pane.height == 0 || screen.hide_cursor() {
+        return None;
+    }
+
+    let (row, col) = screen.cursor_position();
+    if row >= pane.height || col >= pane.width {
+        return None;
+    }
+
+    Some((pane.x.saturating_add(col), pane.y.saturating_add(row)))
+}
+
 const SGR_MOUSE_PREFIX: &[u8] = b"\x1b[<";
 
 fn mouse_prefix_suffix_len(bytes: &[u8]) -> usize {
     let max_len = bytes.len().min(SGR_MOUSE_PREFIX.len());
-    for len in (1..=max_len).rev() {
+    for len in (2..=max_len).rev() {
         if bytes[bytes.len() - len..] == SGR_MOUSE_PREFIX[..len] {
             return len;
         }
@@ -609,6 +628,13 @@ enum ParsedSgrMouseSequence {
     Complete { event: MouseEvent, consumed: usize },
     Incomplete,
     Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseRoutingResult {
+    Handled,
+    NotHandled,
+    Exit,
 }
 
 fn mouse_button_from_code(code: u16) -> Option<MouseButton> {
@@ -672,12 +698,14 @@ fn parse_sgr_mouse_sequence(bytes: &[u8]) -> ParsedSgrMouseSequence {
                         _ => return ParsedSgrMouseSequence::Invalid,
                     }
                 } else if suffix == b'm' {
-                    MouseEventKind::Up(mouse_button_from_code(code).unwrap_or(MouseButton::Left))
+                    let button = mouse_button_from_code(code).unwrap_or(MouseButton::Left);
+                    MouseEventKind::Up(button)
                 } else if code & 0b0010_0000 != 0 {
-                    let Some(button) = mouse_button_from_code(code) else {
-                        return ParsedSgrMouseSequence::Invalid;
-                    };
-                    MouseEventKind::Drag(button)
+                    match mouse_button_from_code(code) {
+                        Some(button) => MouseEventKind::Drag(button),
+                        None if code & 0b11 == 0b11 => MouseEventKind::Moved,
+                        None => return ParsedSgrMouseSequence::Invalid,
+                    }
                 } else {
                     let Some(button) = mouse_button_from_code(code) else {
                         return ParsedSgrMouseSequence::Invalid;
@@ -722,7 +750,7 @@ fn process_host_mouse_event(
     state: &mut AppState,
     tmux_pane: &mut Option<TmuxPane>,
     tmux_mouse_captured: &mut bool,
-) -> Result<bool, VmuxError> {
+) -> Result<MouseRoutingResult, VmuxError> {
     let sidebar_chunks = split_sidebar(sidebar_area);
     match sidebar_mouse_target_from_point(
         sidebar_chunks[0],
@@ -752,10 +780,7 @@ fn process_host_mouse_event(
                         changed = state.selected != *session_index
                             || state
                                 .selected_pane_target()
-                                .map(|selected| {
-                                    selected.window_id != pane.window_id
-                                        || selected.pane_id != pane.pane_id
-                                })
+                                .map(|selected| selected.pane_id != pane.pane_id)
                                 .unwrap_or(true);
                         if changed {
                             state.select_pane(*session_index, pane);
@@ -769,35 +794,36 @@ fn process_host_mouse_event(
                 }
             }
             *tmux_mouse_captured = false;
+            Ok(MouseRoutingResult::Handled)
         }
         Some(SidebarMouseTarget::Exit)
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
         {
-            return Ok(true);
+            *tmux_mouse_captured = false;
+            Ok(MouseRoutingResult::Exit)
         }
         _ if rect_contains(pane_area, mouse.column, mouse.row) || *tmux_mouse_captured => {
-            if let Some(bytes) = tmux_mouse_event_to_bytes(mouse, pane_area) {
-                send_raw_input_to_tmux(tmux_pane, &bytes)?;
-                match mouse.kind {
-                    MouseEventKind::Down(_) => *tmux_mouse_captured = true,
-                    MouseEventKind::Up(_) => *tmux_mouse_captured = false,
-                    MouseEventKind::ScrollUp
-                    | MouseEventKind::ScrollDown
-                    | MouseEventKind::ScrollLeft
-                    | MouseEventKind::ScrollRight
-                    | MouseEventKind::Moved
-                    | MouseEventKind::Drag(_) => {}
-                }
+            let bytes = tmux_mouse_event_to_bytes(mouse, pane_area);
+            send_raw_input_to_tmux(tmux_pane, &bytes)?;
+            match mouse.kind {
+                MouseEventKind::Down(_) => *tmux_mouse_captured = true,
+                MouseEventKind::Up(_) => *tmux_mouse_captured = false,
+                MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+                | MouseEventKind::Moved
+                | MouseEventKind::Drag(_) => {}
             }
+            Ok(MouseRoutingResult::Handled)
         }
         _ => {
             if matches!(mouse.kind, MouseEventKind::Up(_)) {
                 *tmux_mouse_captured = false;
             }
+            Ok(MouseRoutingResult::NotHandled)
         }
     }
-
-    Ok(false)
 }
 
 fn drain_host_input(
@@ -816,7 +842,8 @@ fn drain_host_input(
         if host_input.pending.starts_with(SGR_MOUSE_PREFIX) {
             match parse_sgr_mouse_sequence(&host_input.pending) {
                 ParsedSgrMouseSequence::Complete { event, consumed } => {
-                    let should_exit = process_host_mouse_event(
+                    let consumed_bytes = host_input.pending[..consumed].to_vec();
+                    match process_host_mouse_event(
                         &event,
                         pane_area,
                         sidebar_area,
@@ -825,10 +852,18 @@ fn drain_host_input(
                         state,
                         tmux_pane,
                         tmux_mouse_captured,
-                    )?;
-                    host_input.pending.drain(..consumed);
-                    if should_exit {
-                        return Ok(true);
+                    )? {
+                        MouseRoutingResult::Handled => {
+                            host_input.pending.drain(..consumed);
+                        }
+                        MouseRoutingResult::NotHandled => {
+                            send_raw_input_to_tmux(tmux_pane, &consumed_bytes)?;
+                            host_input.pending.drain(..consumed);
+                        }
+                        MouseRoutingResult::Exit => {
+                            host_input.pending.drain(..consumed);
+                            return Ok(true);
+                        }
                     }
                 }
                 ParsedSgrMouseSequence::Incomplete => break,
@@ -900,7 +935,7 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
             // Size the embedded tmux client to the pane that actually renders tmux output.
             tmux_pane = Some(TmuxPane::spawn(
                 adapter,
-                &selected.name,
+                &selected.id,
                 state.selected_pane_target(),
                 chunks[0],
             )?);
@@ -964,10 +999,13 @@ pub fn run(adapter: &mut dyn TmuxAdapter) -> Result<(), VmuxError> {
 
                     // Render the tmux screen into the left-hand pane.
                     // TODO: if this becomes a hot path, avoid rebuilding the entire pane every frame.
-                    let lines =
-                        screen_to_lines(pane.parser.screen(), chunks[0].width, chunks[0].height);
+                    let screen = pane.parser.screen();
+                    let lines = screen_to_lines(screen, chunks[0].width, chunks[0].height);
                     let paragraph = Paragraph::new(lines);
                     frame.render_widget(paragraph, chunks[0]);
+                    if let Some((cursor_x, cursor_y)) = visible_cursor_position(screen, chunks[0]) {
+                        frame.set_cursor_position((cursor_x, cursor_y));
+                    }
                 } else {
                     let paragraph = Paragraph::new("no session");
                     frame.render_widget(paragraph, chunks[0]);
@@ -1051,6 +1089,7 @@ mod tests {
     #[test]
     fn session_label_line_shows_attached_suffix() {
         let session = TmuxSession {
+            id: "demo".to_string(),
             name: "demo".to_string(),
             windows: Some(2),
             attached: true,
@@ -1065,36 +1104,33 @@ mod tests {
     fn build_sidebar_rows_groups_panes_under_sessions_with_spacers() {
         let mut state = AppState::new(vec![
             TmuxSession {
+                id: "beta".to_string(),
                 name: "beta".to_string(),
                 windows: None,
                 attached: false,
             },
             TmuxSession {
+                id: "alpha".to_string(),
                 name: "alpha".to_string(),
                 windows: None,
                 attached: true,
             },
         ]);
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        state.observe_recent_panes(
-            vec![
-                RecentPane {
-                    session_name: "alpha".to_string(),
-                    window_id: "@1".to_string(),
-                    pane_id: "%1".to_string(),
-                    title: "server logs".to_string(),
-                    observed_at: now,
-                },
-                RecentPane {
-                    session_name: "beta".to_string(),
-                    window_id: "@2".to_string(),
-                    pane_id: "%2".to_string(),
-                    title: "worker".to_string(),
-                    observed_at: now,
-                },
-            ],
-            now,
-        );
+        state.observe_recent_panes(vec![
+            RecentPane {
+                session_id: "alpha".to_string(),
+                pane_id: "%1".to_string(),
+                title: "server logs".to_string(),
+                observed_at: now,
+            },
+            RecentPane {
+                session_id: "beta".to_string(),
+                pane_id: "%2".to_string(),
+                title: "worker".to_string(),
+                observed_at: now,
+            },
+        ]);
 
         let rows = build_sidebar_rows(&state);
         assert_eq!(
@@ -1104,8 +1140,7 @@ mod tests {
                 SidebarRow::Pane {
                     session_index: 0,
                     pane: RecentPane {
-                        session_name: "alpha".to_string(),
-                        window_id: "@1".to_string(),
+                        session_id: "alpha".to_string(),
                         pane_id: "%1".to_string(),
                         title: "server logs".to_string(),
                         observed_at: now,
@@ -1116,8 +1151,7 @@ mod tests {
                 SidebarRow::Pane {
                     session_index: 1,
                     pane: RecentPane {
-                        session_name: "beta".to_string(),
-                        window_id: "@2".to_string(),
+                        session_id: "beta".to_string(),
                         pane_id: "%2".to_string(),
                         title: "worker".to_string(),
                         observed_at: now,
@@ -1136,8 +1170,7 @@ mod tests {
             SidebarRow::Pane {
                 session_index: 0,
                 pane: RecentPane {
-                    session_name: "alpha".to_string(),
-                    window_id: "@1".to_string(),
+                    session_id: "alpha".to_string(),
                     pane_id: "%1".to_string(),
                     title: "server logs".to_string(),
                     observed_at: SystemTime::UNIX_EPOCH,
@@ -1148,8 +1181,7 @@ mod tests {
             SidebarRow::Pane {
                 session_index: 1,
                 pane: RecentPane {
-                    session_name: "beta".to_string(),
-                    window_id: "@2".to_string(),
+                    session_id: "beta".to_string(),
                     pane_id: "%2".to_string(),
                     title: "worker".to_string(),
                     observed_at: SystemTime::UNIX_EPOCH,
@@ -1212,8 +1244,7 @@ mod tests {
             SidebarRow::Pane {
                 session_index: 0,
                 pane: RecentPane {
-                    session_name: "alpha".to_string(),
-                    window_id: "@1".to_string(),
+                    session_id: "alpha".to_string(),
                     pane_id: "%1".to_string(),
                     title: "server logs".to_string(),
                     observed_at: SystemTime::UNIX_EPOCH,
@@ -1243,7 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_sgr_mouse_sequence_decodes_press_release_and_modifiers() {
+    fn parse_sgr_mouse_sequence_decodes_press_release_move_and_modifiers() {
         match parse_sgr_mouse_sequence(b"\x1b[<0;26;4M") {
             ParsedSgrMouseSequence::Complete { event, consumed } => {
                 assert_eq!(consumed, 10);
@@ -1262,9 +1293,15 @@ mod tests {
 
         match parse_sgr_mouse_sequence(b"\x1b[<3;26;4m") {
             ParsedSgrMouseSequence::Complete { event, .. } => {
-                assert!(matches!(event.kind, MouseEventKind::Up(_)));
-                assert_eq!(event.column, 25);
-                assert_eq!(event.row, 3);
+                assert_eq!(
+                    event,
+                    MouseEvent {
+                        kind: MouseEventKind::Up(MouseButton::Left),
+                        column: 25,
+                        row: 3,
+                        modifiers: KeyModifiers::empty(),
+                    }
+                );
             }
             _ => panic!("expected complete mouse release"),
         }
@@ -1278,12 +1315,21 @@ mod tests {
             }
             _ => panic!("expected complete mouse scroll"),
         }
+
+        match parse_sgr_mouse_sequence(b"\x1b[<35;31;5M") {
+            ParsedSgrMouseSequence::Complete { event, .. } => {
+                assert_eq!(event.kind, MouseEventKind::Moved);
+                assert_eq!(event.column, 30);
+                assert_eq!(event.row, 4);
+            }
+            _ => panic!("expected complete mouse move"),
+        }
     }
 
     #[test]
-    fn mouse_prefix_suffix_len_preserves_partial_mouse_prefix() {
+    fn mouse_prefix_suffix_len_preserves_partial_mouse_prefix_without_swallowing_escape() {
         assert_eq!(mouse_prefix_suffix_len(b"hello"), 0);
-        assert_eq!(mouse_prefix_suffix_len(b"\x1b"), 1);
+        assert_eq!(mouse_prefix_suffix_len(b"\x1b"), 0);
         assert_eq!(mouse_prefix_suffix_len(b"\x1b["), 2);
         assert_eq!(mouse_prefix_suffix_len(b"abc\x1b[<"), 3);
         assert_eq!(find_mouse_prefix(b"abc\x1b[<0;1;1M"), Some(3));
@@ -1294,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_mouse_event_to_bytes_encodes_pane_relative_coordinates() {
+    fn tmux_mouse_event_to_bytes_encodes_pane_relative_coordinates_and_clamps_capture() {
         let pane = Rect::new(24, 1, 50, 10);
 
         assert_eq!(
@@ -1307,7 +1353,7 @@ mod tests {
                 },
                 pane,
             ),
-            Some(b"\x1b[<0;2;3M".to_vec()),
+            b"\x1b[<0;2;3M".to_vec(),
         );
         assert_eq!(
             tmux_mouse_event_to_bytes(
@@ -1319,7 +1365,7 @@ mod tests {
                 },
                 pane,
             ),
-            Some(b"\x1b[<3;2;3m".to_vec()),
+            b"\x1b[<3;2;3m".to_vec(),
         );
         assert_eq!(
             tmux_mouse_event_to_bytes(
@@ -1331,7 +1377,118 @@ mod tests {
                 },
                 pane,
             ),
-            Some(b"\x1b[<68;7;4M".to_vec()),
+            b"\x1b[<68;7;4M".to_vec(),
+        );
+        assert_eq!(
+            tmux_mouse_event_to_bytes(
+                &MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: 30,
+                    row: 4,
+                    modifiers: KeyModifiers::ALT,
+                },
+                pane,
+            ),
+            b"\x1b[<43;7;4M".to_vec(),
+        );
+        assert_eq!(
+            tmux_mouse_event_to_bytes(
+                &MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    column: 999,
+                    row: 999,
+                    modifiers: KeyModifiers::empty(),
+                },
+                pane,
+            ),
+            b"\x1b[<3;50;10m".to_vec(),
+        );
+    }
+
+    #[test]
+    fn process_host_mouse_event_clears_capture_on_release_outside_pane() {
+        let pane_area = Rect::new(0, 0, 76, 10);
+        let sidebar_area = Rect::new(76, 0, 24, 10);
+        let mut state = AppState::new(vec![TmuxSession {
+            id: "demo".to_string(),
+            name: "demo".to_string(),
+            windows: None,
+            attached: true,
+        }]);
+        let rows = build_sidebar_rows(&state);
+        let list_state = ListState::default();
+        let mut tmux_pane = None;
+        let mut tmux_mouse_captured = true;
+
+        let result = process_host_mouse_event(
+            &MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 200,
+                row: 200,
+                modifiers: KeyModifiers::empty(),
+            },
+            pane_area,
+            sidebar_area,
+            &rows,
+            &list_state,
+            &mut state,
+            &mut tmux_pane,
+            &mut tmux_mouse_captured,
+        )
+        .expect("mouse release should succeed");
+
+        assert_eq!(result, MouseRoutingResult::Handled);
+        assert!(!tmux_mouse_captured);
+    }
+
+    #[test]
+    fn process_host_mouse_event_reports_unclaimed_mouse_sequences() {
+        let pane_area = Rect::new(0, 0, 76, 10);
+        let sidebar_area = Rect::new(76, 0, 24, 10);
+        let mut state = AppState::new(vec![TmuxSession {
+            id: "demo".to_string(),
+            name: "demo".to_string(),
+            windows: None,
+            attached: true,
+        }]);
+        let rows = build_sidebar_rows(&state);
+        let list_state = ListState::default();
+        let mut tmux_pane = None;
+        let mut tmux_mouse_captured = false;
+
+        let result = process_host_mouse_event(
+            &MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 200,
+                row: 200,
+                modifiers: KeyModifiers::empty(),
+            },
+            pane_area,
+            sidebar_area,
+            &rows,
+            &list_state,
+            &mut state,
+            &mut tmux_pane,
+            &mut tmux_mouse_captured,
+        )
+        .expect("mouse routing should succeed");
+
+        assert_eq!(result, MouseRoutingResult::NotHandled);
+    }
+
+    #[test]
+    fn visible_cursor_position_tracks_tmux_cursor_visibility() {
+        let mut parser = Parser::new(4, 8, 0);
+        parser.process(b"ab\x1b[2;3H");
+        assert_eq!(
+            visible_cursor_position(parser.screen(), Rect::new(10, 20, 8, 4)),
+            Some((12, 21)),
+        );
+
+        parser.process(b"\x1b[?25l");
+        assert_eq!(
+            visible_cursor_position(parser.screen(), Rect::new(10, 20, 8, 4)),
+            None,
         );
     }
 }

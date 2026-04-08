@@ -14,6 +14,7 @@ impl FakeTmux {
         let sessions = names
             .iter()
             .map(|name| TmuxSession {
+                id: (*name).to_string(),
                 name: (*name).to_string(),
                 windows: None,
                 attached: false,
@@ -44,11 +45,10 @@ impl TmuxAdapter for FakeTmux {
 
     fn build_client_command(
         &mut self,
-        session_name: &str,
-        _window_id: Option<&str>,
+        session_id: &str,
         _pane_id: Option<&str>,
     ) -> Result<std::process::Command, vmux::tmux::TmuxError> {
-        self.last_client.borrow_mut().push(session_name.to_string());
+        self.last_client.borrow_mut().push(session_id.to_string());
         Ok(Command::new("tmux-client-placeholder"))
     }
 }
@@ -59,7 +59,7 @@ fn fake_tmux_adapter_records_client_build() {
     let sessions = fake.list_sessions().unwrap();
     assert_eq!(sessions.len(), 2);
 
-    let _cmd = fake.build_client_command("two", None, None).unwrap();
+    let _cmd = fake.build_client_command("two", None).unwrap();
     assert_eq!(fake.last_client.borrow().as_slice(), &["two".to_string()]);
 }
 
@@ -67,7 +67,7 @@ fn fake_tmux_adapter_records_client_build() {
 fn real_tmux_adapter_builds_exact_pane_target_command() {
     let mut adapter = RealTmuxAdapter::from_env();
     let cmd = adapter
-        .build_client_command("demo", Some("@7"), Some("%9"))
+        .build_client_command("$demo", Some("%9"))
         .expect("build client command");
 
     let args: Vec<String> = cmd
@@ -79,11 +79,7 @@ fn real_tmux_adapter_builds_exact_pane_target_command() {
         vec![
             "attach-session".to_string(),
             "-t".to_string(),
-            "demo".to_string(),
-            ";".to_string(),
-            "select-window".to_string(),
-            "-t".to_string(),
-            "@7".to_string(),
+            "$demo".to_string(),
             ";".to_string(),
             "select-pane".to_string(),
             "-t".to_string(),
@@ -120,11 +116,8 @@ impl Drop for TmuxServerGuard {
     }
 }
 
-/// Best-effort real tmux integration test for the adapter using an isolated
-/// tmux server. Skips when `tmux` is not available.
 #[test]
 fn real_tmux_list_sessions_on_isolated_server() {
-    // Check tmux availability.
     if Command::new("tmux").arg("-V").output().is_err() {
         eprintln!("skipping real tmux adapter test: tmux not available");
         return;
@@ -135,7 +128,6 @@ fn real_tmux_list_sessions_on_isolated_server() {
         socket: socket.clone(),
     };
 
-    // Start an isolated tmux server with a single session.
     let status = Command::new("tmux")
         .args([
             "-L",
@@ -152,10 +144,9 @@ fn real_tmux_list_sessions_on_isolated_server() {
         return;
     }
 
-    // Point the adapter at the isolated server via env var.
     std::env::set_var("VMUX_TMUX_SOCKET", socket.clone());
     let mut adapter = RealTmuxAdapter::from_env();
     let sessions = adapter.list_sessions().expect("list_sessions failed");
 
-    assert!(sessions.iter().any(|s| s.name == "vmux_test"));
+    assert!(sessions.iter().any(|s| s.name == "vmux_test" && s.id.starts_with('$')));
 }

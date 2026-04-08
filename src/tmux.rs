@@ -4,6 +4,7 @@ use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxSession {
+    pub id: String,
     pub name: String,
     pub windows: Option<u32>,
     pub attached: bool,
@@ -37,38 +38,28 @@ impl fmt::Display for TmuxError {
 impl std::error::Error for TmuxError {}
 
 impl From<std::io::Error> for TmuxError {
-    fn from(e: std::io::Error) -> Self {
-        TmuxError::Io(e)
+    fn from(error: std::io::Error) -> Self {
+        TmuxError::Io(error)
     }
 }
 
 impl From<std::string::FromUtf8Error> for TmuxError {
-    fn from(e: std::string::FromUtf8Error) -> Self {
-        TmuxError::Utf8(e)
+    fn from(error: std::string::FromUtf8Error) -> Self {
+        TmuxError::Utf8(error)
     }
 }
 
-/// Abstraction over tmux so the UI can be tested in isolation.
 pub trait TmuxAdapter {
-    /// List all tmux sessions.
     fn list_sessions(&mut self) -> Result<Vec<TmuxSession>, TmuxError>;
-
-    /// List windows currently flagged as having a bell.
     fn list_bell_windows(&mut self) -> Result<Vec<TmuxBellWindow>, TmuxError>;
-
-    /// Build a tmux client command that attaches to the given session, optionally
-    /// selecting an exact window and pane inside it.
     fn build_client_command(
         &mut self,
-        session_name: &str,
-        window_id: Option<&str>,
+        session_id: &str,
         pane_id: Option<&str>,
     ) -> Result<Command, TmuxError>;
 }
 
-/// Real tmux adapter that shells out to the `tmux` binary.
 pub struct RealTmuxAdapter {
-    /// Optional tmux socket name (from `VMUX_TMUX_SOCKET` env var).
     socket_name: Option<String>,
 }
 
@@ -80,7 +71,7 @@ impl RealTmuxAdapter {
 
     fn base_command(&self) -> Command {
         let mut cmd = Command::new("tmux");
-        if let Some(ref socket) = self.socket_name {
+        if let Some(socket) = self.socket_name.as_ref() {
             cmd.arg("-L").arg(socket);
         }
         cmd
@@ -89,33 +80,31 @@ impl RealTmuxAdapter {
 
 impl TmuxAdapter for RealTmuxAdapter {
     fn list_sessions(&mut self) -> Result<Vec<TmuxSession>, TmuxError> {
-        // Format: name:windows:attached_flag
         let mut cmd = self.base_command();
         cmd.arg("list-sessions")
             .arg("-F")
-            .arg("#S:#{session_windows}:#{?session_attached,1,0}");
+            .arg("#{session_id}\t#S\t#{session_windows}\t#{?session_attached,1,0}");
         let output = cmd.output()?;
         if !output.status.success() {
             return Err(TmuxError::TmuxFailed(format!(
-                "tmux list-sessions exited with status {status}",
-                status = output.status
+                "tmux list-sessions exited with status {}",
+                output.status
             )));
         }
+
         let stdout = String::from_utf8(output.stdout)?;
         let mut sessions = Vec::new();
         for line in stdout.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() < 3 {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() != 4 {
                 return Err(TmuxError::Parse(format!(
                     "unexpected list-sessions line: {line}"
                 )));
             }
-            let name = parts[0].to_string();
-            let windows = parts[1].parse::<u32>().ok();
-            let attached = match parts[2] {
+            let attached = match parts[3] {
                 "1" => true,
                 "0" => false,
                 other => {
@@ -125,8 +114,9 @@ impl TmuxAdapter for RealTmuxAdapter {
                 }
             };
             sessions.push(TmuxSession {
-                name,
-                windows,
+                id: parts[0].to_string(),
+                name: parts[1].to_string(),
+                windows: parts[2].parse::<u32>().ok(),
                 attached,
             });
         }
@@ -134,7 +124,6 @@ impl TmuxAdapter for RealTmuxAdapter {
     }
 
     fn list_bell_windows(&mut self) -> Result<Vec<TmuxBellWindow>, TmuxError> {
-        // Format: session_name:window_id:bell_flag
         let mut cmd = self.base_command();
         cmd.arg("list-windows")
             .arg("-a")
@@ -143,10 +132,11 @@ impl TmuxAdapter for RealTmuxAdapter {
         let output = cmd.output()?;
         if !output.status.success() {
             return Err(TmuxError::TmuxFailed(format!(
-                "tmux list-windows exited with status {status}",
-                status = output.status
+                "tmux list-windows exited with status {}",
+                output.status
             )));
         }
+
         let stdout = String::from_utf8(output.stdout)?;
         let mut windows = Vec::new();
         for line in stdout.lines() {
@@ -154,7 +144,7 @@ impl TmuxAdapter for RealTmuxAdapter {
                 continue;
             }
             let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() < 3 {
+            if parts.len() != 3 {
                 return Err(TmuxError::Parse(format!(
                     "unexpected list-windows line: {line}"
                 )));
@@ -172,17 +162,11 @@ impl TmuxAdapter for RealTmuxAdapter {
 
     fn build_client_command(
         &mut self,
-        session_name: &str,
-        window_id: Option<&str>,
+        session_id: &str,
         pane_id: Option<&str>,
     ) -> Result<Command, TmuxError> {
         let mut cmd = self.base_command();
-        // For the split-view host we always run a nested tmux client inside
-        // vmux's own PTY, so we consistently use `attach-session`.
-        cmd.arg("attach-session").arg("-t").arg(session_name);
-        if let Some(window_id) = window_id {
-            cmd.arg(";").arg("select-window").arg("-t").arg(window_id);
-        }
+        cmd.arg("attach-session").arg("-t").arg(session_id);
         if let Some(pane_id) = pane_id {
             cmd.arg(";").arg("select-pane").arg("-t").arg(pane_id);
         }
